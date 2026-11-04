@@ -18,8 +18,6 @@ For a local installation, copy the `ha_sonde_tools` directory into `/addons`, re
 | `zone` | `zone.home` | Home Assistant zone entity used as the circle's center. |
 | `radius_km` | `30` | Telegram alert radius in kilometers. Accepts 0.1 to 500. |
 | `archive_radius_km` | `0` | Local history radius in kilometers. Use 0 to follow `radius_km`, or enter a positive radius up to 500. |
-| `poll_seconds` | `60` | Delay between polling cycles in seconds. Accepts 30 to 120. HTTP requests add to the time between observations. |
-| `landing_max_altitude_m` | `500` | Upper limit for the last received fix in the signal loss check, measured in absolute GPS altitude. Accepts −400 to 9,000 m. Set it for the terrain around your zone. |
 | `ground_elevation_m` | Unset | Optional approximate ground elevation near the expected touchdown, in the same vertical reference as the GPS altitude. |
 | `timezone` | `Europe/Budapest` | IANA time zone for Telegram timestamps, such as `Europe/London` or `America/Denver`. |
 | `startup_test` | `false` | Sends a test message at startup. |
@@ -29,9 +27,9 @@ For a local installation, copy the `ha_sonde_tools` directory into `/addons`, re
 
 **Predicted landing.** The app uses the final point of a fresh SondeHub forecast and checks whether the forecast landing time is still in the future. An alert is sent when that endpoint is within the configured radius, even if the sonde is currently outside it. The message time is the forecast ETA.
 
-**Likely touchdown.** When the last GPS fix shows descent within 1 km of a recent predicted touchdown, the app waits until the ETA has passed and the fix is at least 60 seconds old. A recent WebSocket batch or a successful REST telemetry snapshot is required. The alert uses the predicted point for the radius check and includes the last GPS fix. The altitude ceiling applies only to the fallback.
+**Likely touchdown.** When the last GPS fix shows descent within 1 km of a recent predicted touchdown, the app waits until the ETA has passed and the fix is at least 60 seconds old. A recent WebSocket batch or a successful REST telemetry snapshot is required. The alert uses the predicted point for the radius check and includes the last GPS fix. The fallback alone uses a 500 m GPS altitude ceiling.
 
-**Estimated landing after signal loss.** Without a suitable nearby forecast, after three minutes without a newer GPS fix, the app checks that the last fix showed descent and was at or below the altitude ceiling. With a configured ground elevation, it projects the last reported descent speed, horizontal speed, and heading to the ground for up to two minutes. The alert checks the estimated point against the radius and includes both map points. If a projection is unavailable, **Signal lost during descent** uses the last GPS fix for the radius check and map link. Terrain variations and changes in wind can shift the actual touchdown.
+**Estimated landing after signal loss.** Without a suitable nearby forecast, after three minutes without a newer GPS fix, the app checks that the last fix showed descent and was at or below 500 m GPS altitude. With a configured ground elevation, it projects the last reported descent speed, horizontal speed, and heading to the ground for up to two minutes. The alert checks the estimated point against the radius and includes both map points. If a projection is unavailable, **Signal lost during descent** uses the last GPS fix for the radius check and map link. Terrain variations and changes in wind can shift the actual touchdown.
 
 The app remembers successful alerts for seven days across restarts. The two alert types are tracked independently for each sonde serial.
 
@@ -43,7 +41,7 @@ The app remembers successful alerts for seven days across restarts. The two aler
 
 ## Location data
 
-The app uses the SondeHub MQTT-over-WebSocket batch feed for live telemetry. It requests a nearby REST snapshot on startup and while disconnected, sending the zone center and a search radius 12 km wider than the larger configured radius. Forecast and recovery lookups use REST. Debug logging includes the resolved zone coordinates. Alert messages include the forecast or observed position via the map link.
+The app uses the SondeHub MQTT-over-WebSocket batch feed for live telemetry. It requests a nearby REST snapshot on startup and while disconnected, sending the zone center and a search radius 12 km wider than the larger configured radius. Forecast and recovery lookups use REST. The notifier checks forecasts and evaluates alerts on a fixed 60-second cycle. Live GPS samples continue to arrive and archive over WebSocket between checks. Debug logging includes the resolved zone coordinates. Alert messages include the forecast or observed position via the map link.
 
 ## Local history
 

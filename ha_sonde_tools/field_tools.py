@@ -62,7 +62,7 @@ def scorecard(database):
 
 
 def fetch_json(url):
-    request = Request(url, headers={"User-Agent": "HA-Sonde-Tools/0.12.1"})
+    request = Request(url, headers={"User-Agent": "HA-Sonde-Tools/0.12.2"})
     with urlopen(request, timeout=10) as response:
         data = response.read()
         if data.startswith(bytes((31, 139))):

@@ -22,10 +22,12 @@ API = "https://api.v2.sondehub.org"
 HA = "http://supervisor/core/api"
 STATE = Path("/data/sent.json")
 WEEK = 7 * 86400
+POLL_INTERVAL_SECONDS = 60
+SIGNAL_LOSS_MAX_ALTITUDE_M = 500
 
 
 def request(url, token=None, payload=None):
-    headers = {"User-Agent": "HA-Sonde-Tools/0.12.1"}
+    headers = {"User-Agent": "HA-Sonde-Tools/0.12.2"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     body = None
@@ -103,7 +105,7 @@ def map_url(position):
     return f"https://www.openstreetmap.org/?mlat={lat:.6f}&mlon={lon:.6f}#map=16/{lat:.6f}/{lon:.6f}"
 
 
-def landings(rows, history, now, max_alt, ground, predicted=None):
+def landings(rows, history, now, ground, predicted=None):
     predicted = predicted or {}
     for serial, frames in rows.items():
         observations = (frames,) if "datetime" in frames else frames.values()
@@ -145,7 +147,7 @@ def landings(rows, history, now, max_alt, ground, predicted=None):
             continue
         logging.debug("Signal check / %s: fix age %.0f s, altitude %.0f m, descent %.1f m/s",
                       serial, age, altitude, descent)
-        if age < 180 or not math.isfinite(altitude) or altitude > max_alt:
+        if age < 180 or not math.isfinite(altitude) or altitude > SIGNAL_LOSS_MAX_ALTITUDE_M:
             continue
 
         try:
@@ -393,7 +395,7 @@ def run(cfg, token, entity, send, health, tz, quiet):
             center = point(zone["latitude"], zone["longitude"])
             if center != last_center:
                 logging.debug("Polling every %s seconds within %.1f km of %s (%.6f, %.6f)",
-                              cfg["poll_seconds"], cfg["radius_km"], cfg["zone"], *center)
+                              POLL_INTERVAL_SECONDS, cfg["radius_km"], cfg["zone"], *center)
                 last_center = center
             if stream is None:
                 stream = TelemetryStream(API, archive_batch)
@@ -403,7 +405,7 @@ def run(cfg, token, entity, send, health, tz, quiet):
             health.fail("Home Assistant zone", f"Cannot resolve the configured zone ({error_detail(error)}).")
             if not quiet():
                 health.flush(send)
-            time.sleep(cfg["poll_seconds"])
+            time.sleep(POLL_INTERVAL_SECONDS)
             continue
         if test_pending and not quiet():
             try:
@@ -473,8 +475,7 @@ def run(cfg, token, entity, send, health, tz, quiet):
         sources = [
             ("Predicted landing", forecast_rows, lambda rows: forecasts(rows, now, save_forecast, forecast_errors)),
             ("Estimated landing after signal loss", streamed,
-             lambda rows: landings(rows, history, now, cfg["landing_max_altitude_m"],
-                                   cfg.get("ground_elevation_m"), predicted)),
+             lambda rows: landings(rows, history, now, cfg.get("ground_elevation_m"), predicted)),
         ]
         for kind, rows, candidates in sources:
             try:
@@ -539,7 +540,7 @@ def run(cfg, token, entity, send, health, tz, quiet):
         health.healthy("Notifier stopped")
         if not quiet():
             health.flush(send)
-        time.sleep(cfg["poll_seconds"])
+        time.sleep(POLL_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":

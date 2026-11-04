@@ -1,6 +1,6 @@
 name: Sonde Tools
 slug: ha_sonde_tools
-version: "0.12.1"
+version: "0.12.2"
 description: Radiosonde tracking, flight history, recovery tools, and Telegram alerts
 arch: [amd64, aarch64]
 startup: application
@@ -16,8 +16,6 @@ options:
   radius_km: 30
   archive_radius_km: 0
   telegram_entity: ""
-  poll_seconds: 60
-  landing_max_altitude_m: 500
   timezone: Europe/Budapest
   startup_test: false
   debug: false
@@ -31,8 +29,6 @@ schema:
   radius_km: float(0.1,500)
   archive_radius_km: float(0,500)
   telegram_entity: str
-  poll_seconds: int(30,120)
-  landing_max_altitude_m: float(-400,9000)
   ground_elevation_m: float(-400,9000)?
   timezone: str
   startup_test: bool
