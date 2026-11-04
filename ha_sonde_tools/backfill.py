@@ -12,11 +12,11 @@ from urllib.request import Request, urlopen
 from uuid import uuid4
 from xml.etree import ElementTree
 
+from app_version import USER_AGENT
 from health_alerts import error_detail
 import archive_storage as archive
 
 BUCKET = "https://sondehub-history.s3.amazonaws.com"
-USER_AGENT = "HA-Sonde-Tools/0.12.2"
 SERIAL = re.compile(r"[A-Z0-9][A-Z0-9_-]{0,79}")
 S3 = "{http://s3.amazonaws.com/doc/2006-03-01/}"
 

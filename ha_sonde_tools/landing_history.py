@@ -17,6 +17,7 @@ from urllib.error import HTTPError
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 import field_tools
+from app_version import APP_VERSION
 import archive_storage as archive
 from health_alerts import error_detail
 
@@ -43,6 +44,7 @@ ICONS = {
     "outlook": '<path d="M5 19h14M8 15l8-8m-5 0h5v5M4 11V5h6"/>',
     "scorecard": '<path d="M4 4v16h16M8 16v-4m4 4V9m4 7V6"/>',
     "backfill": '<path d="M12 3v12m-4-4 4 4 4-4M5 16v4h14v-4"/>',
+    "diagnostics": '<path d="M3 12h4l3-6 4 12 3-6h4M4 4h16v16H4z"/>',
     "database": '<ellipse cx="12" cy="5" rx="7" ry="3"/><path d="M5 5v7c0 2 3 3 7 3s7-1 7-3V5M5 12v7c0 2 3 3 7 3s7-1 7-3v-7"/>',
 }
 
@@ -1344,7 +1346,24 @@ Imported GPS samples appear in Flight, Full map, and Coverage.</p>
 </form>"""
 
 
-def history_page(query, center, radius, timezone, map_url, notify_radius=None, import_token="", tiles=None, backfill=None):
+def diagnostics_view(token, results):
+    checks = "".join(
+        f'<tr><td>{escape(name)}</td><td><strong>{escape(status)}</strong></td><td>{escape(detail)}</td></tr>'
+        for name, status, detail in (results or ())
+    )
+    report = ("<div class='table'><table><thead><tr><th>Check</th><th>Status</th><th>Details</th></tr></thead>"
+              f"<tbody>{checks}</tbody></table></div>") if checks else ""
+    return (
+        f'<h2 class="section-title">{icon("diagnostics")}Diagnostics</h2>'
+        '<p>Check the data feed and local archive, or send a real test message to the configured Telegram chat.</p>'
+        f'<form class="form-row" method="post"><input type="hidden" name="token" value="{escape(token)}">'
+        '<button name="diagnostic_action" value="checks">Run integration checks</button>'
+        '<button name="diagnostic_action" value="telegram">Send Telegram test</button></form>'
+        + report
+    )
+
+
+def history_page(query, center, radius, timezone, map_url, notify_radius=None, import_token="", tiles=None, backfill=None, diagnostic_results=None):
     notify_radius = radius if notify_radius is None else notify_radius
     period = query.get("days", ["30"])[0]
     periods = {"7": "7 days", "30": "30 days", "365": "1 year", "0": "All history"}
@@ -1355,17 +1374,17 @@ def history_page(query, center, radius, timezone, map_url, notify_radius=None, i
     page = max(1, int(page_text)) if page_text.isascii() and page_text.isdecimal() and len(page_text) <= 9 else 1
     hide_recovered = query.get("hide_recovered") == ["1"]
     active_tab = query.get("tab", ["history"])[0]
-    if active_tab not in ("history", "map", "flight", "recovery", "heatmap", "coverage", "outlook", "scorecard", "backfill"):
+    if active_tab not in ("history", "map", "flight", "recovery", "heatmap", "coverage", "outlook", "scorecard", "backfill", "diagnostics"):
         active_tab = "history"
     show_map = active_tab == "map"
     show_flight = active_tab == "flight"
     show_recovery = active_tab == "recovery"
     show_heatmap = active_tab == "heatmap"
     exact_serial = show_flight or show_recovery
-    analytical = active_tab in ("heatmap", "coverage", "outlook", "scorecard", "backfill")
+    analytical = active_tab in ("heatmap", "coverage", "outlook", "scorecard", "backfill", "diagnostics")
     filters = {"days": period, "serial": serial, "hide_recovered": int(hide_recovered)}
     tabs = []
-    for tab, label in (("history", "History"), ("map", "Full map"), ("flight", "Flight"), ("recovery", "Recovery Mode"), ("heatmap", "Heatmap"), ("coverage", "Coverage"), ("outlook", "Launches"), ("scorecard", "Scorecard"), ("backfill", "Backfill")):
+    for tab, label in (("history", "History"), ("map", "Full map"), ("flight", "Flight"), ("recovery", "Recovery Mode"), ("heatmap", "Heatmap"), ("coverage", "Coverage"), ("outlook", "Launches"), ("scorecard", "Scorecard"), ("backfill", "Backfill"), ("diagnostics", "Diagnostics")):
         href = escape(urlencode({**filters, "tab": tab}))
         current = ' aria-current="page"' if tab == active_tab else ""
         tabs.append(f'<a href="?{href}"{current}>{icon(tab)}{label}</a>')
@@ -1452,10 +1471,19 @@ def history_page(query, center, radius, timezone, map_url, notify_radius=None, i
         content = scorecard_view()
     if active_tab == "backfill":
         content = backfill_view(backfill, center, radius, import_token)
+    if active_tab == "diagnostics":
+        content = diagnostics_view(import_token, diagnostic_results)
     serial_form = "" if analytical else f"""<form class="form-row card" method="get"><input type="hidden" name="tab" value="{active_tab}">{date_filter}
 <label>{"Exact sonde serial" if exact_serial else "Sonde serial"} <input name="serial" value="{escape(serial)}" maxlength="80"></label>
 {recovery_filter}
 <button>{"Show sonde" if exact_serial else "Apply filters"}</button></form>"""
+    try:
+        count = f"{archive_count(DATABASE, int(time.time() // 60)):,} archived sondes"
+        footprint = archive_footprint(DATABASE) + " database"
+    except (OSError, sqlite3.Error):
+        if active_tab != "diagnostics":
+            raise
+        count, footprint = "Archive unavailable", ""
     view = content if active_tab == "history" else f'<section class="card">{content}</section>'
     panel_link = """
 <script>
@@ -1484,8 +1512,8 @@ try {
     <div class="metric">{icon("radius")}<div><small>Archive radius</small><strong>{radius:g} km</strong></div></div>
     <div class="metric">{icon("bell")}<div><small>Telegram radius</small><strong>{notify_radius:g} km</strong></div></div>
   </div>
-  <div class="archive-stats">{icon("database")}<strong>{archive_count(DATABASE, int(time.time() // 60)):,} archived sondes</strong>
-    <span title="SQLite database and write-ahead log">· {archive_footprint(DATABASE)} database</span></div>
+  <div class="archive-stats">{icon("database")}<strong>{count}</strong>
+    <span title="SQLite database and write-ahead log">{footprint}</span></div>
   </div>
 </header>
 <nav class="tabs" aria-label="SondeHub views">{"".join(tabs)}</nav>
@@ -1502,10 +1530,12 @@ try {
 <label>Fetch from SondeHub <input name="serial" placeholder="Exact sonde serial" required maxlength="80"></label>
 <button>Fetch and archive</button></form>
 </div></details>
-</main></div></body></html>"""
+</main>
+<footer class="app-footer">Sonde Tools <span>v{escape(APP_VERSION)}</span></footer>
+</div></body></html>"""
 
 
-def serve(center, radius, timezone, map_url, fetch_reports, notify_radius, import_telemetry, tiles=None, health=None, backfill=None):
+def serve(center, radius, timezone, map_url, fetch_reports, notify_radius, import_telemetry, tiles=None, health=None, backfill=None, diagnostics=None):
     import_token = token_urlsafe(32)
 
     class Handler(BaseHTTPRequestHandler):
@@ -1527,6 +1557,21 @@ def serve(center, radius, timezone, map_url, fetch_reports, notify_radius, impor
             token = form.get("token", [""])[0]
             if not token.isascii() or not compare_digest(token, import_token):
                 self.send_error(403, "Refresh the history page before importing")
+                return
+            diagnostic_action = form.get("diagnostic_action", [""])[0]
+            if diagnostic_action:
+                if diagnostics is None or diagnostic_action not in ("checks", "telegram"):
+                    self.send_error(400, "Unknown diagnostic action")
+                    return
+                results = diagnostics(diagnostic_action)
+                body = history_page({"tab": ["diagnostics"]}, center(), radius, timezone, map_url,
+                                    notify_radius, import_token, tiles, backfill, results).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
                 return
             action = form.get("backfill_action", [""])[0]
             if action and backfill:
@@ -1572,7 +1617,7 @@ def serve(center, radius, timezone, map_url, fetch_reports, notify_radius, impor
             body = (f'<!doctype html><html lang="en"><meta charset="utf-8"><title>Telemetry import</title>'
                     f'<h1>Telemetry import</h1><p>{escape(message)}</p>'
                     f'<p><a href="?">Back to history</a> · <a href="?{download}">Download saved JSON</a></p>'
-                    '</html>').encode()
+                    f'<footer>Sonde Tools v{escape(APP_VERSION)}</footer></html>').encode()
             self.send_response(status)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Cache-Control", "no-store")

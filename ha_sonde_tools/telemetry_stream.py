@@ -20,6 +20,11 @@ class TelemetryStream:
         self.last_batch = None
         Thread(target=self.run, daemon=True).start()
 
+    def status(self):
+        with self.lock:
+            age = time.monotonic() - self.last_batch if self.last_batch is not None else None
+            return self.ready, age
+
     def drain(self):
         with self.lock:
             rows, self.rows = self.rows, {}

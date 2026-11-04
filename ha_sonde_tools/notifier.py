@@ -5,6 +5,7 @@ import math
 import os
 import sqlite3
 import time
+from contextlib import closing
 from datetime import datetime, time as wall_time
 from html import escape
 from pathlib import Path
@@ -13,6 +14,7 @@ from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
 import landing_history
+from app_version import USER_AGENT
 from backfill import Backfill, fetch_archive
 from field_tools import distance
 from health_alerts import HealthAlerts, error_detail
@@ -26,15 +28,15 @@ POLL_INTERVAL_SECONDS = 60
 SIGNAL_LOSS_MAX_ALTITUDE_M = 500
 
 
-def request(url, token=None, payload=None):
-    headers = {"User-Agent": "HA-Sonde-Tools/0.12.2"}
+def request(url, token=None, payload=None, timeout=20):
+    headers = {"User-Agent": USER_AGENT}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     body = None
     if payload is not None:
         headers["Content-Type"] = "application/json"
         body = json.dumps(payload).encode()
-    with urlopen(Request(url, body, headers), timeout=20) as response:
+    with urlopen(Request(url, body, headers), timeout=timeout) as response:
         body = response.read()
         logging.debug("HTTP %s %s (%s bytes, encoding=%s)",
                       response.status, url.split("?")[0], len(body),
@@ -313,8 +315,54 @@ def run(cfg, token, entity, send, health, tz, quiet):
             tiles = {"url": tile_url, "attribution": escape(tile_attribution)}
         except ValueError:
             logging.warning("Custom basemap ignored: configure an HTTPS tile URL with {z}, {x}, {y} and attribution.")
+    def diagnostics(action):
+        if action == "telegram":
+            if quiet():
+                return [("Telegram", "Waiting", "Do Not Disturb is active. Try again after quiet hours.")]
+            try:
+                send("Sonde Tools · diagnostics test message")
+            except (OSError, EOFError, TypeError, ValueError, RuntimeError) as error:
+                logging.warning("Diagnostics Telegram test: %s", error)
+                return [("Telegram", "Failed", error_detail(error))]
+            return [("Telegram", "Passed", "Home Assistant confirmed delivery to the configured chat.")]
+
+        results = []
+        ready, age = stream.status() if stream is not None else (False, None)
+        if ready and age is not None and age <= 120:
+            results.append(("SondeHub WebSocket", "Passed", f"Last valid GPS batch arrived {age:.0f} seconds ago."))
+        else:
+            results.append(("SondeHub WebSocket", "Waiting", "No recent valid GPS batch. Check the app log for reconnects."))
+        try:
+            zone = request(f"{HA}/states/{quote(cfg['zone'], safe='.')}", token, timeout=6)["attributes"]
+            point(zone["latitude"], zone["longitude"])
+            results.append(("Home Assistant zone", "Passed", f"{cfg['zone']} has valid coordinates."))
+        except (OSError, EOFError, KeyError, TypeError, ValueError) as error:
+            results.append(("Home Assistant zone", "Failed", error_detail(error)))
+        try:
+            rows = request(f"{API}/predictions?vehicles=", timeout=8)
+            if not isinstance(rows, list):
+                raise ValueError("Expected a forecast list")
+            errors = []
+            usable = list(forecasts(rows, time.time(), errors=errors))
+            status = "Check" if errors else "Passed"
+            results.append(("SondeHub forecasts", status,
+                            f"{len(rows)} records, {len(usable)} current forecasts, {len(errors)} parse errors."))
+        except (OSError, EOFError, TypeError, ValueError) as error:
+            results.append(("SondeHub forecasts", "Failed", error_detail(error)))
+        try:
+            if not Path(landing_history.DATABASE).is_file():
+                raise sqlite3.OperationalError("Archive file is missing")
+            with closing(sqlite3.connect(landing_history.DATABASE, timeout=2)) as db:
+                db.execute("BEGIN IMMEDIATE")
+                db.execute("SELECT id FROM telemetry_fixes LIMIT 1").fetchone()
+                db.rollback()
+            results.append(("Local archive", "Passed", "SQLite is readable and a write transaction can start."))
+        except sqlite3.Error as error:
+            results.append(("Local archive", "Failed", error_detail(error)))
+        return results
+
     landing_history.serve(lambda: last_center, archive_radius, tz, map_url, recovery_reports,
-                          notify_radius, import_telemetry, tiles, health=health, backfill=backfill)
+                          notify_radius, import_telemetry, tiles, health=health, backfill=backfill, diagnostics=diagnostics)
 
     def save_alerts():
         temp = STATE.with_suffix(".tmp")

@@ -159,3 +159,7 @@ New telemetry uses separate SQLite tables for GPS fixes, receiver metadata, and 
 Enable dnd_enabled and set dnd_from and dnd_to in 24-hour HH:MM format. The schedule repeats daily in the app timezone. For example, 22:00 to 07:00 mutes Telegram starting at 22:00 and resumes it at 07:00. Matching start and end times leave notifications enabled.
 
 The app keeps collecting telemetry and recording landing events during quiet hours. It skips sonde messages and forecast edits while muted. A sonde may still trigger an alert after quiet hours if it still qualifies at the next check. Health alerts stay queued, and a configured startup test waits until quiet hours end.
+
+## Diagnostics
+
+Open **Diagnostics** to run integration checks for the SondeHub WebSocket and forecast API, Home Assistant zone, and local SQLite archive. **Send Telegram test** sends a real message to the configured chat and reports the outcome. The test respects Do Not Disturb. These checks do not create flight events.

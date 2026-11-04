@@ -10,6 +10,8 @@ from statistics import median
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from app_version import USER_AGENT
+
 
 def distance(center, position):
     lat, lon, plat, plon = map(math.radians, (*center, *position))
@@ -62,7 +64,7 @@ def scorecard(database):
 
 
 def fetch_json(url):
-    request = Request(url, headers={"User-Agent": "HA-Sonde-Tools/0.12.2"})
+    request = Request(url, headers={"User-Agent": USER_AGENT})
     with urlopen(request, timeout=10) as response:
         data = response.read()
         if data.startswith(bytes((31, 139))):

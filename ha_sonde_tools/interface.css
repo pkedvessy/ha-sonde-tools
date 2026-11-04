@@ -186,3 +186,9 @@ tbody tr:hover { background: var(--surface-alt); }
 .backfill-form { margin-top: 14px; }
 .backfill-form details { flex: 1 0 100%; }
 .station-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%,230px),1fr)); gap: 6px; margin-top: 8px; }
+
+.app-footer {
+  display: flex; justify-content: flex-end; gap: .5rem;
+  padding: 12px 2px 0; color: var(--muted); font-size: .8rem;
+}
+.app-footer span { font-variant-numeric: tabular-nums; }
