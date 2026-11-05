@@ -230,7 +230,7 @@ def main():
 
     def send(message):
         response = request(f"{HA}/services/telegram_bot/send_message?return_response", token, {
-            "entity_id": entity, "message": message, "parse_mode": "plain_text",
+            "entity_id": entity, "message": f"🎈 {message}", "parse_mode": "plain_text",
             "disable_web_page_preview": True,
         })
         result = response.get("service_response") if isinstance(response, dict) else None
@@ -407,7 +407,7 @@ def run(cfg, token, entity, send, health, tz, quiet):
                 )
                 request(f"{HA}/services/telegram_bot/edit_message", token, {
                     "entity_id": entity, "message_id": previous["message_id"],
-                    "message": f"{message}\nForecast updated · {status} · moved {moved:.1f} km",
+                    "message": f"🎈 {message}\nForecast updated · {status} · moved {moved:.1f} km",
                     "parse_mode": "plain_text", "disable_web_page_preview": True,
                 })
                 health.healthy("Telegram delivery")
