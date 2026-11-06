@@ -152,7 +152,7 @@ The header shows the number of distinct archived sonde serials and the approxima
 
 ### Archive format
 
-New telemetry uses separate SQLite tables for GPS fixes, receiver metadata, and reception reports. Extra fields and per-receiver differences are stored as typed values. Forecast route points use columns for position, altitude, and time. JSON downloads are reconstructed from these tables.
+New telemetry uses separate SQLite tables for GPS fixes, receiver metadata, and reception reports. Extra fields and per-receiver differences are stored as typed values. Forecast route points use columns for position, altitude, and time. JSON downloads are reconstructed from these tables. Telemetry columns declare REAL for measurements, INTEGER for counters, and TEXT for metadata; only binary receiver signatures and generic extension values use BLOB. Existing tables are rebuilt transactionally on upgrade, preserving IDs and relationships. Known numeric measurements and counters (including GPS coordinates, altitude, speed, temperature, signal levels, and frame numbers) use numeric values even when the source sends strings. Identifiers, timestamps, encoded payloads, and invalid numeric strings remain unchanged. Downloads therefore return normalized numbers for these measurement fields. Existing archives are converted once at startup in a transaction. Freed database pages can be reused; the file size does not necessarily decrease immediately.
 
 ## Do not disturb
 

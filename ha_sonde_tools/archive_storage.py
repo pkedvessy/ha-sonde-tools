@@ -1,5 +1,7 @@
 import hashlib
 import math
+import re
+from decimal import Decimal, InvalidOperation
 from datetime import datetime
 
 FIX = (
@@ -17,9 +19,122 @@ STANDARD = set(FIX + REPORT + RECEIVER + ("serial",))
 GPS = ("lat", "lon", "alt", "vel_v", "vel_h", "heading")
 
 
+# Only measurements and counters: identifiers and encoded payloads stay textual.
+NUMERIC = frozenset((
+    "frame", "lat", "lon", "alt", "vel_v", "vel_h", "heading", "sats",
+    "temp", "humidity", "pressure", "batt", "burst_timer", "tx_frequency",
+    "snr", "rssi", "frequency", "upload_time_delta", "uploader_alt",
+))
+COUNTERS = frozenset(("frame", "sats", "burst_timer"))
+NUMBER = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
+
+
+def numeric(value):
+    if type(value) is not str or not NUMBER.fullmatch(value.strip()):
+        return value
+    try:
+        exact = Decimal(value.strip())
+        if exact == exact.to_integral_value():
+            if -(2**63) <= exact < 2**63:
+                return int(exact)
+            return value
+        result = float(exact)
+        return result if math.isfinite(result) and result != 0 else value
+    except (InvalidOperation, ValueError, OverflowError):
+        return value
+
+
+def normalize(row):
+    result = dict(row)
+    for key, value in row.items():
+        if key in NUMERIC:
+            value = numeric(value)
+            if key not in COUNTERS and type(value) in (int, float):
+                value = float(value)
+        elif key in STANDARD and type(value) in (str, int, float):
+            value = str(value)
+        result[key] = value
+    return result
+
+
+def normalize_existing(db):
+    db.execute("CREATE TABLE IF NOT EXISTS archive_migrations (name TEXT PRIMARY KEY)")
+    name = "numeric_measurements_v1"
+    if db.execute("SELECT 1 FROM archive_migrations WHERE name=?", (name,)).fetchone():
+        return
+    db.create_function("archive_numeric", 1, numeric)
+    try:
+        for table, columns in (("telemetry_fixes", FIX), ("telemetry_reports", REPORT),
+                               ("telemetry_receivers", RECEIVER)):
+            for column in columns:
+                if column in NUMERIC:
+                    db.execute(f"UPDATE {table} SET {column}=archive_numeric({column}) "
+                               f"WHERE typeof({column})='text'")
+        for column in NUMERIC:
+            db.execute("UPDATE telemetry_fields SET value=archive_numeric(value) "
+                       "WHERE path=? AND kind='scalar' AND typeof(value)='text'", ("/" + column,))
+        # Receiver signatures must match the normalized profiles used by new writes.
+        for receiver in db.execute(f"SELECT id, {', '.join(RECEIVER)} FROM telemetry_receivers").fetchall():
+            receiver_id, *profile = receiver
+            signature = hashlib.sha256(repr(tuple(profile)).encode()).digest()
+            existing = db.execute("SELECT id FROM telemetry_receivers WHERE signature=?", (signature,)).fetchone()
+            if existing and existing[0] != receiver_id:
+                db.execute("UPDATE telemetry_reports SET receiver_id=? WHERE receiver_id=?", (existing[0], receiver_id))
+                db.execute("DELETE FROM telemetry_receivers WHERE id=?", (receiver_id,))
+            else:
+                db.execute("UPDATE telemetry_receivers SET signature=? WHERE id=?", (signature, receiver_id))
+        db.execute("INSERT INTO archive_migrations VALUES (?)", (name,))
+    finally:
+        db.create_function("archive_numeric", 1, None)
+
+
 def fields(columns):
-    # BLOB affinity preserves upstream scalar types, including numeric strings.
-    return ", ".join(f"{column} BLOB" for column in columns)
+    return ", ".join(f"{column} {column_type(column)}" for column in columns)
+
+
+def column_type(column):
+    return "INTEGER" if column in COUNTERS else "REAL" if column in NUMERIC else "TEXT"
+
+
+def typed_schema(db):
+    tables = ("telemetry_fixes", "telemetry_receivers", "telemetry_reports", "telemetry_fields")
+    if all(row[2] == column_type(row[1]) for table, columns in
+           ((tables[0], FIX), (tables[1], RECEIVER), (tables[2], REPORT))
+           for row in db.execute(f"PRAGMA table_info({table})") if row[1] in columns):
+        return
+    # Rebuild related tables together, preserving IDs and foreign-key relationships.
+    db.execute("SAVEPOINT typed_archive")
+    try:
+        db.execute("DROP VIEW IF EXISTS telemetry")
+        for table in tables:
+            sql = db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()[0]
+            for original in tables:
+                sql = re.sub(r"\b" + original + r"\b", original + "_typed", sql)
+            for column in FIX + RECEIVER + REPORT:
+                sql = re.sub(r"\b" + column + r"\s+BLOB\b", column + " " + column_type(column), sql)
+            db.execute(sql)
+            db.execute(f"INSERT INTO {table}_typed SELECT * FROM {table}")
+        for table in reversed(tables):
+            db.execute(f"DROP TABLE {table}")
+        for table in tables:
+            db.execute(f"ALTER TABLE {table}_typed RENAME TO {table}")
+        # REAL/TEXT affinity can change Python scalar types used by signatures.
+        db.execute("UPDATE telemetry_receivers SET signature=randomblob(32)")
+        for receiver in db.execute(f"SELECT id, {', '.join(RECEIVER)} FROM telemetry_receivers").fetchall():
+            receiver_id, *profile = receiver
+            signature = hashlib.sha256(repr(tuple(profile)).encode()).digest()
+            existing = db.execute("SELECT id FROM telemetry_receivers WHERE signature=?", (signature,)).fetchone()
+            if existing:
+                db.execute("UPDATE telemetry_reports SET receiver_id=? WHERE receiver_id=?", (existing[0], receiver_id))
+                db.execute("DELETE FROM telemetry_receivers WHERE id=?", (receiver_id,))
+            else:
+                db.execute("UPDATE telemetry_receivers SET signature=? WHERE id=?", (signature, receiver_id))
+        db.execute("INSERT OR IGNORE INTO archive_migrations VALUES ('explicit_column_types_v1')")
+        db.execute("RELEASE typed_archive")
+    except Exception:
+        db.execute("ROLLBACK TO typed_archive")
+        db.execute("RELEASE typed_archive")
+        raise
 
 
 def initialize(db):
@@ -49,6 +164,8 @@ def initialize(db):
             FOREIGN KEY (fix_id, uploader) REFERENCES telemetry_reports(fix_id, uploader)
         ) WITHOUT ROWID
     """)
+    normalize_existing(db)
+    typed_schema(db)
     normalized = ", ".join(f"f.{key}" for key in GPS)
     db.execute(f"""
         CREATE VIEW IF NOT EXISTS telemetry AS
@@ -98,6 +215,7 @@ def write_packets(db, samples):
     receivers = {}
     added = 0
     for serial, observed, uploader, row in samples:
+        row = normalize(row)
         key = serial, observed
         if key not in fixes:
             found = db.execute(f"SELECT id, {', '.join(FIX)} FROM telemetry_fixes WHERE serial=? AND observed=?", key).fetchone()
