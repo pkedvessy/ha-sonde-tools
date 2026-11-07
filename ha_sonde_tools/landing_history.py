@@ -17,6 +17,7 @@ from urllib.error import HTTPError
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 import field_tools
+from flight_distance import read_distances, chart as distance_chart
 from app_version import APP_VERSION
 import archive_storage as archive
 from health_alerts import error_detail
@@ -232,6 +233,7 @@ def read_flight(serial, tz):
             SELECT latitude, longitude, reported FROM recovery
             WHERE serial = ? AND status = 'Recovered' AND latitude IS NOT NULL AND longitude IS NOT NULL
         """, (serial,)).fetchone()
+        distances = read_distances(db, serial)
     latest = tracks["tracks"][0]["latest"]["observed"] if tracks["tracks"] else 0
     if forecasts:
         latest = max(latest, forecasts[-1]["issued"])
@@ -246,7 +248,7 @@ def read_flight(serial, tz):
             scored.add(snapshot["issued"])
         forecasts = [dict(snapshot, score=snapshot["issued"] in scored) for snapshot in forecasts]
     return {"serial": serial, "tracks": tracks["tracks"], "limited": tracks["limited"],
-            "forecasts": forecasts, "recovery": position, "latest": read_latest(serial)}
+            "forecasts": forecasts, "recovery": position, "latest": read_latest(serial), "distances": distances}
 
 
 def read_forecast_path(serial, issued):
@@ -337,22 +339,34 @@ def record(serial, kind, now, when, position, distance_km, last_fix):
               serial, kind, now - WEEK))
 
 
-def read_events(days, serial, page, hide_recovered=False):
+EVENT_FILTER = """
+    FROM events LEFT JOIN recovery USING (serial)
+    WHERE recorded >= ? AND instr(upper(events.serial), upper(?)) > 0
+        AND (NOT ? OR recovery.status IS NULL OR recovery.status != 'Recovered'
+             OR recovery.reported IS NULL OR recovery.reported < events.recorded - 21600)
+"""
+
+
+def count_events(days, serial, hide_recovered=False):
+    since = time.time() - days * 86400 if days else 0
+    with closing(sqlite3.connect(DATABASE)) as db:
+        return db.execute("SELECT COUNT(*) " + EVENT_FILTER, (since, serial, hide_recovered)).fetchone()[0]
+
+
+def read_events(days, serial, page, hide_recovered=False, page_size=100):
     since = time.time() - days * 86400 if days else 0
     with closing(sqlite3.connect(DATABASE)) as db:
         db.row_factory = sqlite3.Row
         return db.execute("""
-            SELECT events.*, CASE
+            SELECT events.id, events.serial, events.kind, events.recorded, events.event_time,
+                events.latitude, events.longitude, events.distance_km, events.last_lat, events.last_lon, CASE
                 WHEN recovery.checked = 0 THEN NULL
                 WHEN recovery.reported < events.recorded - 21600 THEN 'No recovery reported for this flight'
                 ELSE recovery.status
             END AS status
-            FROM events LEFT JOIN recovery USING (serial)
-            WHERE recorded >= ? AND instr(upper(events.serial), upper(?)) > 0
-                AND (NOT ? OR recovery.status IS NULL OR recovery.status != 'Recovered'
-                     OR recovery.reported IS NULL OR recovery.reported < events.recorded - 21600)
-            ORDER BY recorded DESC, id DESC LIMIT ? OFFSET ?
-        """, (since, serial, hide_recovered, 101 if page else -1, (page - 1) * 100 if page else 0)).fetchall()
+        """ + EVENT_FILTER + " ORDER BY recorded DESC, id DESC LIMIT ? OFFSET ?",
+            (since, serial, hide_recovered, page_size if page else -1,
+             (page - 1) * page_size if page else 0)).fetchall()
 
 
 def latest_event_positions(rows, include_gps=True):
@@ -1372,6 +1386,8 @@ def history_page(query, center, radius, timezone, map_url, notify_radius=None, i
     serial = query.get("serial", [""])[0][:80]
     page_text = query.get("page", ["1"])[0]
     page = max(1, int(page_text)) if page_text.isascii() and page_text.isdecimal() and len(page_text) <= 9 else 1
+    size_text = query.get("page_size", ["25"])[0]
+    page_size = int(size_text) if size_text in ("25", "50", "100") else 25
     hide_recovered = query.get("hide_recovered") == ["1"]
     active_tab = query.get("tab", ["history"])[0]
     if active_tab not in ("history", "map", "flight", "recovery", "heatmap", "coverage", "outlook", "scorecard", "backfill", "diagnostics"):
@@ -1382,14 +1398,19 @@ def history_page(query, center, radius, timezone, map_url, notify_radius=None, i
     show_heatmap = active_tab == "heatmap"
     exact_serial = show_flight or show_recovery
     analytical = active_tab in ("heatmap", "coverage", "outlook", "scorecard", "backfill", "diagnostics")
-    filters = {"days": period, "serial": serial, "hide_recovered": int(hide_recovered)}
+    filters = {"days": period, "serial": serial, "hide_recovered": int(hide_recovered), "page_size": page_size}
     tabs = []
     for tab, label in (("history", "History"), ("map", "Full map"), ("flight", "Flight"), ("recovery", "Recovery Mode"), ("heatmap", "Heatmap"), ("coverage", "Coverage"), ("outlook", "Launches"), ("scorecard", "Scorecard"), ("backfill", "Backfill"), ("diagnostics", "Diagnostics")):
         href = escape(urlencode({**filters, "tab": tab}))
         current = ' aria-current="page"' if tab == active_tab else ""
         tabs.append(f'<a href="?{href}"{current}>{icon(tab)}{label}</a>')
-    results = [] if exact_serial or analytical else read_events(int(period), serial, None if show_map else page, hide_recovered)
-    rows = latest_event_positions(results[:100]) if active_tab == "history" else []
+    total_events = count_events(int(period), serial, hide_recovered) if active_tab == "history" else 0
+    total_pages = max(1, (total_events + page_size - 1) // page_size)
+    if active_tab == "history":
+        page = min(page, total_pages)
+    results = [] if exact_serial or analytical else read_events(
+        int(period), serial, None if show_map else page, hide_recovered, page_size)
+    rows = latest_event_positions(results) if active_tab == "history" else []
     options = "".join(f'<option value="{key}" {"selected" if key == period else ""}>{label}</option>'
                       for key, label in periods.items())
     date_filter = "" if exact_serial else f'<label>Recorded within <select name="days">{options}</select></label>'
@@ -1422,10 +1443,18 @@ def history_page(query, center, radius, timezone, map_url, notify_radius=None, i
         )
     navigation = []
     for target, label in (() if show_map else ((page - 1, "Previous"), (page + 1, "Next"))):
-        if target >= 1 and (target < page or len(results) > 100):
+        if 1 <= target <= total_pages:
             href = escape(urlencode({"days": period, "serial": serial, "page": target,
-                                     "hide_recovered": int(hide_recovered)}))
+                                     "hide_recovered": int(hide_recovered), "page_size": page_size, "tab": "history"}))
             navigation.append(f'<a href="?{href}">{label}</a>')
+    first_event = (page - 1) * page_size + 1 if total_events else 0
+    last_event = min(page * page_size, total_events)
+    pager = (f'<nav class="pager" aria-label="Event pages">'
+             f'<span>Events {first_event:,}–{last_event:,} of {total_events:,} · Page {page:,} of {total_pages:,}</span> '
+             + ' '.join(navigation) + '</nav>')
+    size_options = "".join(f'<option value="{size}" {"selected" if size == page_size else ""}>{size}</option>'
+                           for size in (25, 50, 100))
+    page_size_filter = f'<label>Events per page <select name="page_size">{size_options}</select></label>' if active_tab == "history" else ""
     legend = "".join(
         f'<span class="legend-item"><i class="swatch" style="--swatch:{color}"></i>{label}</span>'
         for label, color in COLORS.items()
@@ -1439,10 +1468,11 @@ def history_page(query, center, radius, timezone, map_url, notify_radius=None, i
 {recovery_shortlist(query, timezone, center)}</div>
 <section class="card"><h2 class="section-title">{icon("history")}Events</h2>
 <p>Distances use the zone at the time of recording. Recovery status comes from SondeHub reports.</p>
+{pager}
 <div class="table"><table><thead><tr><th>Event time</th><th>Serial</th><th>Type</th>
 <th>Recovery</th><th>Distance</th><th>Position</th></tr></thead>
 <tbody>{"".join(entries) or '<tr><td class="empty" colspan="6">No events match these filters.</td></tr>'}</tbody></table></div>
-<nav class="pager" aria-label="Event pages">{' '.join(navigation)}</nav></section>""" if active_tab == "history" else ""
+{pager}</section>""" if active_tab == "history" else ""
     content = (f'<h2 class="section-title">{icon("map")}Full map</h2><p><span id="map-event-count">{len(results)}</span> matching events</p><div class="legend">{legend}'
                '<span class="legend-item"><i class="swatch" style="--swatch:#818894"></i>Recovered</span>'
                '<span class="legend-item"><i class="swatch" style="--swatch:#7851c8"></i>Observed route</span>'
@@ -1453,9 +1483,11 @@ def history_page(query, center, radius, timezone, map_url, notify_radius=None, i
         content = "<h2>Flight</h2><p>Enter an exact sonde serial to compare observed and predicted routes.</p>"
         if serial:
             flight = read_flight(serial.strip(), timezone)
+            distances = flight.pop("distances")
             content = ("<h2>Flight " + escape(flight["serial"]) + "</h2>"
                        "<p>Purple shows observed GPS fixes. Dashed blue shows the selected forecast, and faint blue dots show earlier touchdown estimates. Green marks a reported recovery when available.</p>"
-                       + full_map([], center, radius, timezone, map_url, notify_radius, tiles, flight=flight))
+                       + full_map([], center, radius, timezone, map_url, notify_radius, tiles, flight=flight)
+                       + distance_chart(distances))
     if show_recovery:
         content = recovery_view(serial.strip(), query.get("terrain") == ["1"], timezone, map_url, tiles) if serial.strip() else "<h2>Recovery Mode</h2><p>Enter a sonde serial to open its recovery view.</p>"
     if show_heatmap:
@@ -1475,7 +1507,7 @@ def history_page(query, center, radius, timezone, map_url, notify_radius=None, i
         content = diagnostics_view(import_token, diagnostic_results)
     serial_form = "" if analytical else f"""<form class="form-row card" method="get"><input type="hidden" name="tab" value="{active_tab}">{date_filter}
 <label>{"Exact sonde serial" if exact_serial else "Sonde serial"} <input name="serial" value="{escape(serial)}" maxlength="80"></label>
-{recovery_filter}
+{recovery_filter}{page_size_filter}
 <button>{"Show sonde" if exact_serial else "Apply filters"}</button></form>"""
     try:
         count = f"{archive_count(DATABASE, int(time.time() // 60)):,} archived sondes"

@@ -163,3 +163,11 @@ The app keeps collecting telemetry and recording landing events during quiet hou
 ## Diagnostics
 
 Open **Diagnostics** to run integration checks for the SondeHub WebSocket and forecast API, Home Assistant zone, and local SQLite archive. **Send Telegram test** sends a real message to the configured chat and reports the outcome. The test respects Do Not Disturb. These checks do not create flight events.
+
+## Event pagination
+
+The History events table defaults to 25 rows per page. Choose 25, 50, or 100 with **Events per page**. Previous and Next retain the active filters and page size; applying filters returns to the first page. SQLite counts matching events separately and fetches only the requested page for the table and compact map. The Full map continues to show all matching events.
+
+## Flight distance chart
+
+The Flight page plots travelled horizontal ground-track distance, remaining forecast route distance, and straight-line distance from the first archived GPS fix to predicted landing, against elapsed time. The first archived fix may be after launch. Calculations use every valid archived GPS fix, not the sampled map route. Gaps over five minutes are excluded, so travelled distance is a lower bound. Each forecast is plotted at its issue time; missing paths do not become zero-distance estimates. Hover over chart points for values. Reload to include new data.

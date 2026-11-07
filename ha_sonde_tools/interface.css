@@ -192,3 +192,7 @@ tbody tr:hover { background: var(--surface-alt); }
   padding: 12px 2px 0; color: var(--muted); font-size: .8rem;
 }
 .app-footer span { font-variant-numeric: tabular-nums; }
+
+.distance-chart { display: block; width: min(100%, 1000px); height: auto; margin-top: 16px; overflow: visible; }
+.distance-chart text { fill: currentColor; font-size: 11px; }
+.distance-chart circle:hover { r: 5; }
