@@ -171,3 +171,5 @@ The History events table defaults to 25 rows per page. Choose 25, 50, or 100 wit
 ## Flight distance chart
 
 The Flight page plots travelled horizontal ground-track distance, remaining forecast route distance, and straight-line distance from the first archived GPS fix to predicted landing, against elapsed time. The first archived fix may be after launch. Calculations use every valid archived GPS fix, not the sampled map route. Gaps over five minutes are excluded, so travelled distance is a lower bound. Each forecast is plotted at its issue time; missing paths do not become zero-distance estimates. Hover over chart points for values. Reload to include new data.
+
+The orange **Estimated total flight length** line adds travelled distance from the latest GPS fix at or before each forecast issue time to that forecast's remaining route length. It shows how the projected total changes during the flight without using future GPS fixes. Missing forecast routes have no total estimate.

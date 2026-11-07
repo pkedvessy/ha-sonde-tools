@@ -36,6 +36,7 @@ def read_distances(db, serial):
     if start is None:
         return None
     forecasts = []
+    fix_index = 0
     paths = iter(db.execute("SELECT issued, latitude, longitude, observed FROM forecast_points WHERE serial=? ORDER BY issued, step", (serial,)))
     pending = next(paths, None)
     for issued, lat, lon in db.execute("SELECT issued, latitude, longitude FROM forecasts WHERE serial=? ORDER BY issued", (serial,)):
@@ -52,7 +53,11 @@ def read_distances(db, serial):
             pending = next(paths, None)
         landing = position(lat, lon)
         if issued >= start and landing is not None:
-            forecasts.append((issued, length if count >= 2 else None, distance(origin, landing)))
+            while fix_index + 1 < len(actual) and actual[fix_index + 1][0] <= issued:
+                fix_index += 1
+            remaining = length if count >= 2 else None
+            estimated_total = actual[fix_index][1] + remaining if remaining is not None else None
+            forecasts.append((issued, remaining, distance(origin, landing), estimated_total))
     return dict(start=start, actual=actual, forecasts=forecasts, gaps=gaps)
 
 
@@ -62,7 +67,8 @@ def chart(data):
     start = data['start']
     series = [(data['actual'], 1, '#7851c8', 'Travelled', False),
               (data['forecasts'], 1, '#2465d0', 'Estimated remaining', True),
-              (data['forecasts'], 2, '#008678', 'Departure to predicted landing', False)]
+              (data['forecasts'], 2, '#008678', 'Departure to predicted landing', False),
+              (data['forecasts'], 3, '#d97706', 'Estimated total flight length', False)]
     end = max([p[0] for p in data['actual']] + [p[0] for p in data['forecasts']])
     maximum = max(1, *(p[key] for rows, key, *_ in series for p in rows if p[key] is not None))
     x = lambda at: 55+640*(at-start)/max(1,end-start)
@@ -92,5 +98,5 @@ def chart(data):
     svg.append('</svg>')
     return ('<section class="flight-panel"><h3>Flight distance</h3>'
             '<p>Horizontal distances from the first archived GPS fix, which may be after launch. Hover over chart points for values.</p>'
-            '<div class="legend"><span style="color:#7851c8">Travelled</span><span style="color:#2465d0">Estimated remaining (dashed)</span><span style="color:#008678">Departure to predicted landing (straight line)</span></div>'
-            + ''.join(svg) + f'<p>GPS gaps over five minutes excluded: {data["gaps"]}. Travelled distance is a lower bound. Missing forecast paths have no remaining-distance value. Reload to include new data.</p></section>')
+            '<div class="legend"><span style="color:#7851c8">Travelled</span><span style="color:#2465d0">Estimated remaining (dashed)</span><span style="color:#008678">Departure to predicted landing (straight line)</span><span style="color:#d97706">Estimated total (travelled + remaining)</span></div>'
+            + ''.join(svg) + f'<p>GPS gaps over five minutes excluded: {data["gaps"]}. Travelled distance is a lower bound. Estimated total combines the last recorded travelled distance available at each forecast issue time with its remaining path. Missing forecast paths have no remaining or total estimate. Reload to include new data.</p></section>')
