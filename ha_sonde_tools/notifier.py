@@ -141,7 +141,11 @@ def landings(rows, history, now, ground, predicted=None):
                               serial, km * 1000, age, eta - now)
                 if age >= 60 and now >= eta:
                     yield serial, position, eta, last, "Likely touchdown"
-                continue
+                    continue
+                if age < 180:
+                    continue
+                # A late ETA must not block the low-altitude signal-loss fallback.
+                # Otherwise the final fix can expire before the next poll after ETA.
 
         try:
             altitude = float(row["alt"])

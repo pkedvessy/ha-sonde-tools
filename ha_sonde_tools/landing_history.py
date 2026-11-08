@@ -272,17 +272,25 @@ def read_forecast_path(serial, issued):
     return segments
 
 
+def pending_recoveries(now):
+    with closing(sqlite3.connect(DATABASE)) as db:
+        return [row[0] for row in db.execute("""
+            WITH archived AS (
+                SELECT serial FROM events
+                UNION SELECT serial FROM telemetry_fixes
+                UNION SELECT serial FROM forecasts
+            )
+            SELECT archived.serial FROM archived LEFT JOIN recovery USING (serial)
+            WHERE recovery.checked IS NULL OR recovery.checked < ?
+            ORDER BY COALESCE(recovery.checked, 0), archived.serial LIMIT 25
+        """, (now - 1800,))]
+
+
 def sync_recoveries(fetch_reports, health=None):
     while True:
         try:
             now = time.time()
-            with closing(sqlite3.connect(DATABASE)) as db:
-                serials = [row[0] for row in db.execute("""
-                    SELECT DISTINCT events.serial FROM events
-                    LEFT JOIN recovery USING (serial)
-                    WHERE recovery.checked IS NULL OR recovery.checked < ?
-                    ORDER BY recovery.checked LIMIT 25
-                """, (now - 1800,))]
+            serials = pending_recoveries(now)
             if serials:
                 reports = fetch_reports(serials)
                 if not isinstance(reports, list):
