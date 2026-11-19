@@ -1,12 +1,15 @@
 name: Sonde Tools
 slug: ha_sonde_tools
-version: "0.13.0"
-description: Radiosonde tracking, flight history, recovery tools, and Telegram alerts (v0.13.0)
+version: "0.14.0"
+description: Radiosonde tracking, flight history, recovery tools, and Telegram alerts
 arch: [amd64, aarch64]
 startup: application
 boot: auto
 init: false
 homeassistant_api: true
+services:
+  - mqtt:want
+watchdog: "http://[HOST]:[PORT:8099]/health"
 ingress: true
 ingress_port: 8099
 panel_title: Sonde Tools
@@ -24,7 +27,9 @@ options:
   dnd_enabled: false
   dnd_from: "22:00"
   dnd_to: "07:00"
+  dnd_summary: true
   telegram_map_image: true
+  telemetry_retention_days: 0
 schema:
   zone: str
   radius_km: float(0.1,500)
@@ -39,6 +44,8 @@ schema:
   dnd_enabled: bool
   dnd_from: str
   dnd_to: str
+  dnd_summary: bool?
+  telemetry_retention_days: int(0,3650)?
   telegram_map_image: bool?
   map_default_basemap: bool?
   map_tile_url: str?

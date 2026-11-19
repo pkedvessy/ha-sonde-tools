@@ -10,6 +10,7 @@ import math
 import socket
 import sqlite3
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -30,6 +31,9 @@ TILE = 256
 MIN_ZOOM, MAX_ZOOM = 10, 14
 PADDING = 90
 IMAGE_TTL_SECONDS = 600
+# Tiles are reused between alerts and diagnostics; OpenStreetMap's tile policy asks clients to cache.
+TILE_CACHE_SIZE = 256
+TILE_CACHE_SECONDS = 7 * 86400
 
 TRACK = (122, 59, 182)
 LAST_FIX = (166, 89, 15)
@@ -73,6 +77,8 @@ class MapRenderer:
     def __init__(self, tile_url=None, attribution=None):
         self.tile_url = tile_url or OSM_TILES
         self.attribution = attribution if tile_url else OSM_ATTRIBUTION
+        self.cache = OrderedDict()
+        self.cache_lock = Lock()
         try:
             self.font = ImageFont.load_default(size=13)
         except TypeError:
@@ -84,8 +90,21 @@ class MapRenderer:
             return None
         url = (self.tile_url.replace("{z}", str(zoom)).replace("{x}", str(x % count))
                .replace("{y}", str(y)).replace("{s}", "a").replace("{r}", ""))
+        now = time.time()
+        with self.cache_lock:
+            cached = self.cache.get(url)
+            if cached and cached[1] > now:
+                self.cache.move_to_end(url)
+                return Image.open(io.BytesIO(cached[0])).convert("RGB")
         with urlopen(Request(url, headers={"User-Agent": USER_AGENT}), timeout=10) as response:
-            return Image.open(io.BytesIO(response.read())).convert("RGB")
+            data = response.read()
+        image = Image.open(io.BytesIO(data)).convert("RGB")  # Validate before caching the encoded bytes.
+        with self.cache_lock:
+            self.cache[url] = data, now + TILE_CACHE_SECONDS
+            self.cache.move_to_end(url)
+            while len(self.cache) > TILE_CACHE_SIZE:
+                self.cache.popitem(last=False)
+        return image
 
     def render(self, landing, last_fix=None, track=(), home=None, label=""):
         points = [landing] + ([last_fix] if last_fix else [])

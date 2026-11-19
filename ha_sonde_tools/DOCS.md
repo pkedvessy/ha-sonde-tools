@@ -23,6 +23,12 @@ For a local installation, copy the `ha_sonde_tools` directory into `/addons`, re
 | `startup_test` | `false` | Sends a test message at startup. |
 | `debug` | `false` | Enables detailed polling and alert logs. |
 | `telegram_map_image` | `true` | Attaches a map image to landing and touchdown alerts. Set to `false` for text-only alerts. |
+| `dashboard_sensor` | `false` | Publishes `sensor.sonde_tools_nearest_active`. See [Home Assistant dashboard card](#home-assistant-dashboard-card). |
+| `health_alerts` | `true` | Sends Telegram messages about failing data sources or storage. |
+| `dnd_enabled`, `dnd_from`, `dnd_to` | `false`, `22:00`, `07:00` | Quiet hours for Telegram. See [Do not disturb](#do-not-disturb). |
+| `dnd_summary` | `true` | After quiet hours, sends one summary of the alerts that were held back. |
+| `telemetry_retention_days` | `0` | Deletes raw GPS telemetry and forecast paths older than this many days. `0` keeps everything. Landing events are always kept. |
+| `map_default_basemap`, `map_tile_url`, `map_tile_attribution` | `true`, unset, unset | Web map and alert image basemap. See [Full map](#full-map). |
 
 ## Alert rules
 
@@ -32,14 +38,17 @@ For a local installation, copy the `ha_sonde_tools` directory into `/addons`, re
 
 **Estimated landing after signal loss.** Without a suitable nearby forecast, after three minutes without a newer GPS fix, the app checks that the last fix showed descent and was at or below 500 m GPS altitude. With a configured ground elevation, it projects the last reported descent speed, horizontal speed, and heading to the ground for up to two minutes. The alert checks the estimated point against the radius and includes both map points. If a projection is unavailable, **Signal lost during descent** uses the last GPS fix for the radius check and map link. Terrain variations and changes in wind can shift the actual touchdown.
 
-**Map images.** Each landing or touchdown alert is sent as a photo with the alert text as its caption. The map marks the predicted or estimated landing, the last GPS fix when known, the last 30 minutes of archived track, and the zone center (an edge arrow when it is outside the frame). Tiles come from OpenStreetMap, or from `map_tile_url` when a custom raster basemap is configured. Home Assistant downloads the image once from the app over the internal Supervisor network on port 8098; nothing is exposed outside Home Assistant. If rendering or photo delivery fails, the alert is sent as text. When a predicted landing moves, only the caption is edited, because Home Assistant cannot replace a sent photo; the image keeps showing the first forecast position.
+**Map images.** Each landing or touchdown alert is sent as a photo with the alert text as its caption. The map marks the predicted or estimated landing, the last GPS fix when known, the last 30 minutes of archived track, and the zone center (an edge arrow when it is outside the frame). Tiles come from the OpenStreetMap tile server, or from `map_tile_url` when a custom raster basemap is configured. The app identifies itself to the tile server, caches up to 256 tiles in memory for a week, and only downloads tiles when an alert or map test is sent, which stays within the OpenStreetMap tile usage policy for occasional use. If you send many alerts, configure a custom tile provider. Rendering is limited to 30 seconds so a slow tile server cannot delay polling. Home Assistant downloads the image once from the app over the internal Supervisor network on port 8098; nothing is exposed outside Home Assistant. If rendering or photo delivery fails, the alert is sent as text. When a predicted landing moves, only the caption is edited, because Home Assistant cannot replace a sent photo; the image keeps showing the first forecast position.
 
-The app remembers successful alerts for seven days across restarts. The two alert types are tracked independently for each sonde serial.
+The app remembers successful alerts for seven days across restarts. The two alert types are tracked independently for each sonde serial. If the saved alert state is unreadable, the app sets it aside as `sent.json.corrupt-*`, starts with an empty state, and sends a health alert, because an alert may be repeated once.
+
+If a forecast update cannot be applied to the original message three times in a row, for example because the message was deleted in Telegram, the app stops editing it for that flight.
 
 ## Troubleshooting
 
 - **The app stops at startup.** Verify that `telegram_entity` starts with `notify.` and matches the exact entity ID shown in the Telegram Bot integration.
 - **The startup test arrives but a flight produces no alerts.** Enable `debug`, save, and restart. Check the **Log** tab for HTTP status, record and candidate counts, distance or duplicate checks, and the sonde's altitude, fix age, and descent speed. A candidate is evaluated against your radius before delivery.
+- **The app restarts by itself.** The Supervisor watchdog restarts the app when its polling loop stops completing for 10 minutes. The log before the restart usually shows what was stuck.
 - **No update appears.** Refresh the app store and check the installed version on the app page. For a local installation, replace the files in the local app directory with the updated source before refreshing.
 
 ## Location data
@@ -68,7 +77,7 @@ The full map uses the OpenFreeMap street basemap by default. The browser loads m
 
 The app stores the complete fields of each received telemetry sample whose GPS position is inside the archive radius. It keeps one sample per serial, GPS timestamp, and reporting receiver. The archive includes in-range samples from the live stream and the REST snapshots available during startup or outages. It starts collecting after upgrade and does not backfill gaps in reception.
 
-Enter an exact serial in **Download raw telemetry** to export a chronological JSON array. A sonde can have archived telemetry even if it never generated a landing event. Raw telemetry is kept until the app data is removed, so storage grows with coverage, traffic, and the archive radius.
+Enter an exact serial in **Download raw telemetry** to export a chronological JSON array. A sonde can have archived telemetry even if it never generated a landing event. By default raw telemetry is kept until the app data is removed, so storage grows with coverage, traffic, and the archive radius. Set `telemetry_retention_days` to limit it; see [Archive maintenance](#archive-maintenance).
 
 ### Import historical telemetry
 
@@ -117,7 +126,11 @@ The History area map and event table show the latest saved GPS fix and forecast 
 
 ## Home Assistant dashboard card
 
-Enable dashboard_sensor in the app configuration and restart. Add a **Markdown** card in manual YAML mode. Replace YOUR_SIDEBAR_PATH with the path shown in your browser when you open the Sonde Tools sidebar panel, without the leading slash.
+Enable dashboard_sensor in the app configuration and restart.
+
+When the MQTT integration is set up (for example with the Mosquitto broker app), the sensor is created through MQTT discovery under a **Sonde Tools** device. It then has a unique ID, keeps its state and history across Home Assistant restarts, and can be renamed or added to areas. A state left by an earlier version is removed once so the discovered sensor keeps the `sensor.sonde_tools_nearest_active` entity ID. Without MQTT, the app writes the state directly as before; that sensor disappears when Home Assistant restarts until the next update, at most a minute later.
+
+Add a **Markdown** card in manual YAML mode. Replace YOUR_SIDEBAR_PATH with the path shown in your browser when you open the Sonde Tools sidebar panel, without the leading slash.
 
 ```yaml
 type: markdown
@@ -153,6 +166,12 @@ The worker checks one request at a time and saves each completed flight and its 
 
 The header shows the number of distinct archived sonde serials and the approximate SQLite footprint, including the write-ahead log. Reload the page to update the footprint. The serial count is cached for up to a minute.
 
+### Archive maintenance
+
+With `telemetry_retention_days` set, the app deletes GPS fixes, reception reports, and forecast paths older than that many days, ten minutes after startup and then every six hours. Landing events, recovery reports, and backfill progress are kept. Backfilled flights older than the retention period are removed at the next run.
+
+Deleted rows free space inside the database for reuse, but the file does not shrink. Select **Compact database** under **Backfill** to rewrite the file and return the space to the disk. Compaction needs free disk space about the size of the database and can take several minutes on a large archive; live telemetry waits until it finishes.
+
 ### Archive format
 
 New telemetry uses separate SQLite tables for GPS fixes, receiver metadata, and reception reports. Extra fields and per-receiver differences are stored as typed values. Forecast route points use columns for position, altitude, and time. JSON downloads are reconstructed from these tables. Telemetry columns declare REAL for measurements, INTEGER for counters, and TEXT for metadata; only binary receiver signatures and generic extension values use BLOB. Existing tables are rebuilt transactionally on upgrade, preserving IDs and relationships. Known numeric measurements and counters (including GPS coordinates, altitude, speed, temperature, signal levels, and frame numbers) use numeric values even when the source sends strings. Identifiers, timestamps, encoded payloads, and invalid numeric strings remain unchanged. Downloads therefore return normalized numbers for these measurement fields. Existing archives are converted once at startup in a transaction. Freed database pages can be reused; the file size does not necessarily decrease immediately.
@@ -161,11 +180,11 @@ New telemetry uses separate SQLite tables for GPS fixes, receiver metadata, and 
 
 Enable dnd_enabled and set dnd_from and dnd_to in 24-hour HH:MM format. The schedule repeats daily in the app timezone. For example, 22:00 to 07:00 mutes Telegram starting at 22:00 and resumes it at 07:00. Matching start and end times leave notifications enabled.
 
-The app keeps collecting telemetry and recording landing events during quiet hours. It skips sonde messages and forecast edits while muted. A sonde may still trigger an alert after quiet hours if it still qualifies at the next check. Health alerts stay queued, and a configured startup test waits until quiet hours end.
+The app keeps collecting telemetry and recording landing events during quiet hours. It skips sonde messages and forecast edits while muted. Alerts that would have been sent are held. At the first check after quiet hours, alerts that still qualify are sent normally, and the rest are listed in one **during quiet hours** summary message (up to ten entries). Set `dnd_summary` to `false` to drop held alerts instead. Health alerts stay queued, and a configured startup test waits until quiet hours end.
 
 ## Diagnostics
 
-Open **Diagnostics** to run integration checks for the SondeHub WebSocket and forecast API, Home Assistant zone, and local SQLite archive. **Send Telegram test** sends a real message to the configured chat and reports the outcome. **Send Telegram map test** renders an alert map around the zone center and sends it as a photo, reporting map rendering and photo delivery separately. The test respects Do Not Disturb. These checks do not create flight events.
+Open **Diagnostics** to run integration checks for the SondeHub WebSocket and forecast API, Home Assistant zone, local SQLite archive, and the dashboard sensor. **Send Telegram test** sends a real message to the configured chat and reports the outcome. **Send Telegram map test** renders an alert map around the zone center and sends it as a photo, reporting map rendering and photo delivery separately. The test respects Do Not Disturb. These checks do not create flight events.
 
 ## Event pagination
 
