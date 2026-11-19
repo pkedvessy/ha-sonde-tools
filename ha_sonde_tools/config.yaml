@@ -1,6 +1,6 @@
 name: Sonde Tools
 slug: ha_sonde_tools
-version: "0.15.0"
+version: "0.15.1"
 description: Radiosonde tracking, flight history, recovery tools, and Telegram alerts
 arch: [amd64, aarch64]
 startup: application
@@ -51,6 +51,11 @@ schema:
   live_entities: bool?
   follow_persons:
     - str
+  mqtt_host: str?
+  mqtt_port: port?
+  mqtt_username: str?
+  mqtt_password: password?
+  mqtt_ssl: bool?
   telegram_map_image: bool?
   map_default_basemap: bool?
   map_tile_url: str?
