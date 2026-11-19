@@ -31,9 +31,10 @@ def discovery_config():
 
 
 class Dashboard:
-    def __init__(self, request, token, health):
+    def __init__(self, request, token, health, broker=None):
         self.request = request
         self.token = token
+        self.broker = broker
         self.health = health
         self.lock = Lock()
         self.client = None
@@ -45,7 +46,7 @@ class Dashboard:
 
     def _start_mqtt(self):
         try:
-            data = mqtt_link.broker(self.request, self.token)
+            data = mqtt_link.broker(self.request, self.token, self.broker)
         except (OSError, ValueError, EOFError) as error:
             logging.info("Dashboard sensor uses the REST API (MQTT unavailable: %s)", error_detail(error))
             return

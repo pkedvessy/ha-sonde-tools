@@ -1,7 +1,7 @@
 """Validated app options, parsed once from the Supervisor's options.json."""
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from html import escape
 from pathlib import Path
@@ -35,6 +35,7 @@ class Settings:
     telemetry_retention_days: int = 0
     live_entities: bool = False
     follow_persons: tuple = ()
+    mqtt_broker: dict = field(default=None, repr=False)  # Holds the broker password.
 
     def is_quiet(self, now=None):
         if self.quiet_hours is None:
@@ -95,6 +96,14 @@ def parse(cfg):
     invalid = [item for item in follow if not item.startswith(("person.", "device_tracker."))]
     if invalid:
         raise ValueError(f"follow_persons accepts person.* or device_tracker.* entities, not {invalid[0]!r}.")
+    mqtt_broker = None
+    host = str(cfg.get("mqtt_host") or "").strip()
+    if host:
+        if any(character in host for character in "/:@ "):
+            raise ValueError("mqtt_host must be a host name or IP address, without a scheme or port.")
+        port = _number(cfg, "mqtt_port", 1883, 1, 65535)
+        mqtt_broker = {"host": host, "port": int(port), "username": str(cfg.get("mqtt_username") or "").strip() or None,
+                       "password": cfg.get("mqtt_password") or None, "ssl": bool(cfg.get("mqtt_ssl", False))}
     return Settings(
         zone=zone, radius_km=radius, archive_radius_km=archive_radius, telegram_entity=entity, timezone=tz,
         startup_test=bool(cfg.get("startup_test", False)), debug=bool(cfg.get("debug", False)),
@@ -106,6 +115,7 @@ def parse(cfg):
         tiles=tiles, custom_tile_url=custom_url, custom_tile_attribution=custom_attribution,
         telemetry_retention_days=int(retention),
         live_entities=bool(cfg.get("live_entities", False)), follow_persons=follow,
+        mqtt_broker=mqtt_broker,
     )
 
 

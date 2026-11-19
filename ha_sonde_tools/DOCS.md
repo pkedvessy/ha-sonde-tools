@@ -26,6 +26,7 @@ For a local installation, copy the `ha_sonde_tools` directory into `/addons`, re
 | `dashboard_sensor` | `false` | Publishes `sensor.sonde_tools_nearest_active`. See [Home Assistant dashboard card](#home-assistant-dashboard-card). |
 | `live_entities` | `false` | Publishes live sonde map trackers and sensors through MQTT. See [Live sonde entities](#live-sonde-entities). |
 | `follow_persons` | Empty | `person.*` or `device_tracker.*` entities. Landings near any of them are alerted too. See [Alerts that follow people](#alerts-that-follow-people). |
+| `mqtt_host`, `mqtt_port`, `mqtt_username`, `mqtt_password`, `mqtt_ssl` | Unset, `1883`, unset, unset, `false` | An external MQTT broker for `dashboard_sensor` and `live_entities`. Leave `mqtt_host` empty to use the Mosquitto broker app. See [Live sonde entities](#live-sonde-entities). |
 | `health_alerts` | `true` | Sends Telegram messages about failing data sources or storage. |
 | `dnd_enabled`, `dnd_from`, `dnd_to` | `false`, `22:00`, `07:00` | Quiet hours for Telegram. See [Do not disturb](#do-not-disturb). |
 | `dnd_summary` | `true` | After quiet hours, sends one summary of the alerts that were held back. |
@@ -224,7 +225,7 @@ Records come from flight summaries. A summary is kept for every archived serial 
 
 ## Live sonde entities
 
-Enable `live_entities` and restart. This needs the MQTT integration (for example the Mosquitto broker app). Entities are created through MQTT discovery under the **Sonde Tools** device:
+Enable `live_entities` and restart. This needs the MQTT integration (for example the Mosquitto broker app). With the Mosquitto broker app, the app finds the broker automatically. With a broker elsewhere on your network, set `mqtt_host` (host name or IP address, no `mqtt://` and no port), `mqtt_port`, and the `mqtt_username` and `mqtt_password` of an account that may publish to `homeassistant/#` and `sonde_tools/#`. Use the same broker as the Home Assistant MQTT integration, or the entities will not appear. Entities are created through MQTT discovery under the **Sonde Tools** device:
 
 | Entity | Description |
 | --- | --- |
