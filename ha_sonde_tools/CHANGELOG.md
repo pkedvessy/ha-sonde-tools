@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.15.0
+
+### Added
+- **Atmospheric sounding** on the Flight page: a Skew-T log-P diagram of temperature and dew point, a wind speed and direction profile, and a hodograph, with the tropopause, freezing level, burst altitude, and strongest wind. Pressure is derived from GPS altitude for sondes without a pressure sensor.
+- **Records** tab: year-in-review statistics, flight records, recovery rate, a flight calendar, monthly and hourly charts, and sonde types.
+- `live_entities`: MQTT device trackers for each nearby sonde and its landing point (shown on the Map card), plus `binary_sensor.sonde_tools_incoming`, `sensor.sonde_tools_active_sondes`, and `sensor.sonde_tools_next_landing`.
+- `follow_persons`: landings near followed people are alerted too, and the message names who the landing is closest to.
+- Flight summaries: per-serial statistics (time span, fix count, highest altitude, fastest wind and descent, coldest reading, type) are saved as telemetry arrives and kept by telemetry retention. Records, the header count, and recovery syncing use them, and the Flight page shows them, also after the raw fixes are removed. Existing archives are summarized once on upgrade.
+
+### Changed
+- The dashboard sensor and live entities share one MQTT setup module.
+
 ## 0.14.0
 
 ### Added

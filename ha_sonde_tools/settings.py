@@ -33,6 +33,8 @@ class Settings:
     custom_tile_url: str = None
     custom_tile_attribution: str = None
     telemetry_retention_days: int = 0
+    live_entities: bool = False
+    follow_persons: tuple = ()
 
     def is_quiet(self, now=None):
         if self.quiet_hours is None:
@@ -86,6 +88,13 @@ def parse(cfg):
                  parse_clock(cfg.get("dnd_to", "07:00"), "dnd_to"))
     tiles, custom_url, custom_attribution = _tiles(cfg)
     retention = _number(cfg, "telemetry_retention_days", 0, 0, 3650)
+    follow = cfg.get("follow_persons") or []
+    if not isinstance(follow, list) or not all(isinstance(item, str) for item in follow):
+        raise ValueError("follow_persons must be a list of person.* entity IDs.")
+    follow = tuple(dict.fromkeys(item.strip() for item in follow if item.strip()))
+    invalid = [item for item in follow if not item.startswith(("person.", "device_tracker."))]
+    if invalid:
+        raise ValueError(f"follow_persons accepts person.* or device_tracker.* entities, not {invalid[0]!r}.")
     return Settings(
         zone=zone, radius_km=radius, archive_radius_km=archive_radius, telegram_entity=entity, timezone=tz,
         startup_test=bool(cfg.get("startup_test", False)), debug=bool(cfg.get("debug", False)),
@@ -96,6 +105,7 @@ def parse(cfg):
         telegram_map_image=bool(cfg.get("telegram_map_image", True)),
         tiles=tiles, custom_tile_url=custom_url, custom_tile_attribution=custom_attribution,
         telemetry_retention_days=int(retention),
+        live_entities=bool(cfg.get("live_entities", False)), follow_persons=follow,
     )
 
 
