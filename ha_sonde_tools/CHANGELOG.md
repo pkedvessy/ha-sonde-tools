@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.16.0
+
+### Added
+- **Flight summary** on the Flight page: flight time, highest altitude with burst time, fastest wind and its altitude, track length, straight-line distance from launch to landing (or first to last fix) with its direction, average ascent and descent rates, coldest reading, number of receivers, frequency, sonde subtype, and the first and last fix positions.
+- **Records**: new records for longest track, farthest drift, longest flight time, and most receivers, and a sortable **Flights** table with one row per sonde.
+- Whole-track statistics are calculated in the background for flights with new fixes (up to 100 flights a minute) and kept in the flight summary when telemetry retention removes the fixes. Existing archives are filled in gradually after the upgrade.
+
 ## 0.15.2
 
 ### Added

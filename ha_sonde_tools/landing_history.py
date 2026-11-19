@@ -18,6 +18,7 @@ from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 import archive_storage as archive
 import field_tools
+import flight_stats
 import records
 import sounding
 from app_version import APP_VERSION
@@ -1257,4 +1258,5 @@ def serve(center, radius, timezone, map_url, fetch_reports, notify_radius, impor
     server = ThreadingHTTPServer(("", port), Handler)
     Thread(target=server.serve_forever, daemon=True).start()
     Thread(target=sync_recoveries, args=(fetch_reports, health), daemon=True).start()
+    Thread(target=flight_stats.run, args=(DATABASE, health), daemon=True, name="flight-stats").start()
     return server
