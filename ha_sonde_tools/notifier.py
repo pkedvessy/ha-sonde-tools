@@ -232,11 +232,16 @@ def main():
         raise ValueError("Set telegram_entity to a Telegram notify.* entity.")
     health = HealthAlerts(cfg.get("health_alerts", True))
 
-    def send(message):
-        response = request(f"{HA}/services/telegram_bot/send_message?return_response", token, {
-            "entity_id": entity, "message": f"🎈 {message}", "parse_mode": "plain_text",
-            "disable_web_page_preview": True,
-        })
+    def send(message, photo_url=None):
+        if photo_url:
+            response = request(f"{HA}/services/telegram_bot/send_photo?return_response", token, {
+                "entity_id": entity, "url": photo_url, "caption": f"🎈 {message}", "parse_mode": "plain_text",
+            }, timeout=60)
+        else:
+            response = request(f"{HA}/services/telegram_bot/send_message?return_response", token, {
+                "entity_id": entity, "message": f"🎈 {message}", "parse_mode": "plain_text",
+                "disable_web_page_preview": True,
+            })
         result = response.get("service_response") if isinstance(response, dict) else None
         chats = result.get("chats") if isinstance(result, dict) else None
         if not isinstance(chats, list) or not chats or not isinstance(chats[0], dict):
@@ -319,6 +324,46 @@ def run(cfg, token, entity, send, health, tz, quiet):
             tiles = {"url": tile_url, "attribution": escape(tile_attribution)}
         except ValueError:
             logging.warning("Custom basemap ignored: configure an HTTPS tile URL with {z}, {x}, {y} and attribution.")
+    renderer = images = None
+    if cfg.get("telegram_map_image", True):
+        try:
+            import map_image
+            custom = tiles is not None and "url" in tiles
+            renderer = map_image.MapRenderer(tile_url if custom else None, tile_attribution if custom else None)
+            images = map_image.ImageServer()
+        except (ImportError, OSError) as error:
+            logging.warning("Telegram map images disabled: %s", error)
+            renderer = images = None
+
+    def map_photo(serial, kind, position, last_fix, center):
+        if renderer is None:
+            return None
+        try:
+            track = map_image.read_track(landing_history.DATABASE, serial, time.time() - 1800)
+        except sqlite3.Error as error:
+            logging.debug("Map track for %s unavailable: %s", serial, error)
+            track = []
+        try:
+            png = renderer.render(position, last_fix, track, center, kind)
+        except (OSError, ValueError) as error:
+            logging.warning("Map image for %s could not be rendered: %s", serial, error)
+            return None
+        return images.publish(png)
+
+    def send_alert(message, serial, kind, position, last_fix, center):
+        """Send with a map image when possible; fall back to a text message."""
+        photo_url = map_photo(serial, kind, position, last_fix, center)
+        if photo_url:
+            try:
+                return send(message, photo_url), True
+            except TimeoutError:
+                raise  # The photo may still arrive; a text fallback could duplicate the alert.
+            except (OSError, ValueError, RuntimeError) as error:
+                logging.warning("Telegram map photo for %s failed, sending text: %s", serial, error)
+            finally:
+                images.discard(photo_url)
+        return send(message), False
+
     def diagnostics(action):
         if action == "telegram":
             if quiet():
@@ -329,6 +374,32 @@ def run(cfg, token, entity, send, health, tz, quiet):
                 logging.warning("Diagnostics Telegram test: %s", error)
                 return [("Telegram", "Failed", error_detail(error))]
             return [("Telegram", "Passed", "Home Assistant confirmed delivery to the configured chat.")]
+        if action == "telegram_map":
+            if renderer is None:
+                reason = ("telegram_map_image is disabled." if not cfg.get("telegram_map_image", True)
+                          else "The map renderer could not start. Check the app log.")
+                return [("Telegram map", "Failed", reason)]
+            if last_center is None:
+                return [("Telegram map", "Waiting", "The configured zone has not been resolved yet.")]
+            if quiet():
+                return [("Telegram map", "Waiting", "Do Not Disturb is active. Try again after quiet hours.")]
+            try:
+                png = renderer.render(last_center, label="Test position · zone center")
+            except (OSError, ValueError) as error:
+                logging.warning("Diagnostics map render: %s", error)
+                return [("Map rendering", "Failed", error_detail(error))]
+            results = [("Map rendering", "Passed", f"Rendered a {len(png) / 1024:.0f} KB PNG from map tiles.")]
+            photo_url = images.publish(png)
+            try:
+                send("Sonde Tools · diagnostics map test\n"
+                     f"Zone center {map_url(last_center)}", photo_url)
+                results.append(("Telegram map", "Passed", "Home Assistant downloaded the image and confirmed delivery."))
+            except (OSError, EOFError, TypeError, ValueError, RuntimeError) as error:
+                logging.warning("Diagnostics Telegram map test: %s", error)
+                results.append(("Telegram map", "Failed", error_detail(error)))
+            finally:
+                images.discard(photo_url)
+            return results
 
         results = []
         ready, age = stream.status() if stream is not None else (False, None)
@@ -409,11 +480,19 @@ def run(cfg, token, entity, send, health, tz, quiet):
                 status = ("Entered" if inside else "Left") + " the Telegram radius" if crossed else (
                     "Inside the Telegram radius" if inside else "Outside the Telegram radius"
                 )
-                request(f"{HA}/services/telegram_bot/edit_message", token, {
-                    "entity_id": entity, "message_id": previous["message_id"],
-                    "message": f"🎈 {message}\nForecast updated · {status} · moved {moved:.1f} km",
-                    "parse_mode": "plain_text", "disable_web_page_preview": True,
-                })
+                text = f"🎈 {message}\nForecast updated · {status} · moved {moved:.1f} km"
+                if previous.get("photo"):
+                    # Telegram cannot turn a photo caption into a text message, and
+                    # Home Assistant has no media edit service, so only the caption changes.
+                    request(f"{HA}/services/telegram_bot/edit_caption", token, {
+                        "entity_id": entity, "message_id": previous["message_id"],
+                        "caption": f"{text}\nMap shows the first forecast position.",
+                    })
+                else:
+                    request(f"{HA}/services/telegram_bot/edit_message", token, {
+                        "entity_id": entity, "message_id": previous["message_id"], "message": text,
+                        "parse_mode": "plain_text", "disable_web_page_preview": True,
+                    })
                 health.healthy("Telegram delivery")
                 previous.update(position=position, inside=inside)
                 save_alerts()
@@ -425,13 +504,13 @@ def run(cfg, token, entity, send, health, tz, quiet):
         if previous is not None:
             logging.debug("%s / %s skipped: already alerted", kind, serial)
             return
-        chats = send(message)
+        chats, photo = send_alert(message, serial, title, position, last_fix[0] if last_fix else None, center)
         health.healthy("Telegram delivery")
         message_id = chats[0].get("message_id")
         sent[key] = now
         if kind == "Predicted landing" and isinstance(message_id, int):
             sent[key] = {"at": now, "entity": entity, "message_id": message_id,
-                         "position": position, "inside": inside}
+                         "position": position, "inside": inside, "photo": photo}
         save_alerts()
         logging.info("Alert sent: %s / %s", kind, serial)
 

@@ -22,6 +22,7 @@ For a local installation, copy the `ha_sonde_tools` directory into `/addons`, re
 | `timezone` | `Europe/Budapest` | IANA time zone for Telegram timestamps, such as `Europe/London` or `America/Denver`. |
 | `startup_test` | `false` | Sends a test message at startup. |
 | `debug` | `false` | Enables detailed polling and alert logs. |
+| `telegram_map_image` | `true` | Attaches a map image to landing and touchdown alerts. Set to `false` for text-only alerts. |
 
 ## Alert rules
 
@@ -30,6 +31,8 @@ For a local installation, copy the `ha_sonde_tools` directory into `/addons`, re
 **Likely touchdown.** When the last GPS fix shows descent within 1 km of a recent predicted touchdown, the app waits until the ETA has passed and the fix is at least 60 seconds old. A recent WebSocket batch or a successful REST telemetry snapshot is required. The alert uses the predicted point for the radius check and includes the last GPS fix. The fallback alone uses a 500 m GPS altitude ceiling.
 
 **Estimated landing after signal loss.** Without a suitable nearby forecast, after three minutes without a newer GPS fix, the app checks that the last fix showed descent and was at or below 500 m GPS altitude. With a configured ground elevation, it projects the last reported descent speed, horizontal speed, and heading to the ground for up to two minutes. The alert checks the estimated point against the radius and includes both map points. If a projection is unavailable, **Signal lost during descent** uses the last GPS fix for the radius check and map link. Terrain variations and changes in wind can shift the actual touchdown.
+
+**Map images.** Each landing or touchdown alert is sent as a photo with the alert text as its caption. The map marks the predicted or estimated landing, the last GPS fix when known, the last 30 minutes of archived track, and the zone center (an edge arrow when it is outside the frame). Tiles come from OpenStreetMap, or from `map_tile_url` when a custom raster basemap is configured. Home Assistant downloads the image once from the app over the internal Supervisor network on port 8098; nothing is exposed outside Home Assistant. If rendering or photo delivery fails, the alert is sent as text. When a predicted landing moves, only the caption is edited, because Home Assistant cannot replace a sent photo; the image keeps showing the first forecast position.
 
 The app remembers successful alerts for seven days across restarts. The two alert types are tracked independently for each sonde serial.
 
@@ -162,7 +165,7 @@ The app keeps collecting telemetry and recording landing events during quiet hou
 
 ## Diagnostics
 
-Open **Diagnostics** to run integration checks for the SondeHub WebSocket and forecast API, Home Assistant zone, and local SQLite archive. **Send Telegram test** sends a real message to the configured chat and reports the outcome. The test respects Do Not Disturb. These checks do not create flight events.
+Open **Diagnostics** to run integration checks for the SondeHub WebSocket and forecast API, Home Assistant zone, and local SQLite archive. **Send Telegram test** sends a real message to the configured chat and reports the outcome. **Send Telegram map test** renders an alert map around the zone center and sends it as a photo, reporting map rendering and photo delivery separately. The test respects Do Not Disturb. These checks do not create flight events.
 
 ## Event pagination
 

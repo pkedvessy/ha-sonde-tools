@@ -1,7 +1,7 @@
 name: Sonde Tools
 slug: ha_sonde_tools
-version: "0.12.11"
-description: Radiosonde tracking, flight history, recovery tools, and Telegram alerts (v0.12.11)
+version: "0.13.0"
+description: Radiosonde tracking, flight history, recovery tools, and Telegram alerts (v0.13.0)
 arch: [amd64, aarch64]
 startup: application
 boot: auto
@@ -24,6 +24,7 @@ options:
   dnd_enabled: false
   dnd_from: "22:00"
   dnd_to: "07:00"
+  telegram_map_image: true
 schema:
   zone: str
   radius_km: float(0.1,500)
@@ -38,6 +39,7 @@ schema:
   dnd_enabled: bool
   dnd_from: str
   dnd_to: str
+  telegram_map_image: bool?
   map_default_basemap: bool?
   map_tile_url: str?
   map_tile_attribution: str?
