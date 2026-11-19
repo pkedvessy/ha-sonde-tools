@@ -1,6 +1,6 @@
 name: Sonde Tools
 slug: ha_sonde_tools
-version: "0.15.2"
+version: "0.16.0"
 description: Radiosonde tracking, flight history, recovery tools, and Telegram alerts
 arch: [amd64, aarch64]
 startup: application
