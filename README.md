@@ -28,3 +28,15 @@ Open **Sonde Tools** from the Home Assistant sidebar or the app's Web UI. The ap
 ## Reporting a problem
 
 Include the installed version, sonde serial, approximate event time with time zone, and the relevant log lines with `debug` enabled. Remove your zone coordinates and any chat details before posting publicly.
+
+## Development
+
+The app code lives in [`ha_sonde_tools`](ha_sonde_tools). Run the checks locally with Python 3.13:
+
+```sh
+pip install -r requirements-dev.txt
+ruff check .
+python -m unittest discover -s tests
+```
+
+CI runs the same checks and builds the image for amd64 and aarch64. Release notes are in [CHANGELOG.md](ha_sonde_tools/CHANGELOG.md).

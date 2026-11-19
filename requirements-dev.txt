@@ -1,0 +1,2 @@
+-r ha_sonde_tools/requirements.txt
+ruff==0.17.5

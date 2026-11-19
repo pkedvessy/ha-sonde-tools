@@ -1,34 +1,40 @@
 import gzip
 import json
 import logging
-import math
 import os
 import sqlite3
 import time
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
 from contextlib import closing
-from datetime import datetime, time as wall_time
-from html import escape
+from datetime import datetime
 from pathlib import Path
-from urllib.parse import quote, urlencode, urlsplit
+from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
-from zoneinfo import ZoneInfo
 
 import landing_history
+import settings as app_settings
+from alert_state import AlertState
 from app_version import USER_AGENT
 from backfill import Backfill, fetch_archive
+from dashboard import Dashboard
+from detection import forecasts, landings, map_url, point, prepare_samples
 from field_tools import distance
 from health_alerts import HealthAlerts, error_detail
+from maintenance import Maintenance
 from telemetry_stream import TelemetryStream
 
 API = "https://api.v2.sondehub.org"
 HA = "http://supervisor/core/api"
 STATE = Path("/data/sent.json")
-WEEK = 7 * 86400
 POLL_INTERVAL_SECONDS = 60
-SIGNAL_LOSS_MAX_ALTITUDE_M = 500
+MAP_RENDER_TIMEOUT_SECONDS = 30
+# The watchdog restarts the app when the poll loop has not completed for this long.
+STALL_SECONDS = 10 * POLL_INTERVAL_SECONDS
+DELIVERY_ERRORS = (OSError, EOFError, TypeError, ValueError, RuntimeError)
 
 
-def request(url, token=None, payload=None, timeout=20):
+def request(url, token=None, payload=None, timeout=20, method=None):
     headers = {"User-Agent": USER_AGENT}
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -36,7 +42,7 @@ def request(url, token=None, payload=None, timeout=20):
     if payload is not None:
         headers["Content-Type"] = "application/json"
         body = json.dumps(payload).encode()
-    with urlopen(Request(url, body, headers), timeout=timeout) as response:
+    with urlopen(Request(url, body, headers, method=method), timeout=timeout) as response:
         body = response.read()
         logging.debug("HTTP %s %s (%s bytes, encoding=%s)",
                       response.status, url.split("?")[0], len(body),
@@ -46,371 +52,252 @@ def request(url, token=None, payload=None, timeout=20):
         return json.loads(body)
 
 
-def point(lat, lon):
-    lat, lon = float(lat), float(lon)
-    if not (-90 <= lat <= 90 and -180 <= lon <= 360):
-        raise ValueError("Invalid coordinates")
-    return lat, (lon + 180) % 360 - 180
-
-
-def timestamp(value):
-    dt = datetime.fromisoformat(value)
-    if dt.tzinfo is None:
-        raise ValueError("Missing time zone")
-    return dt.timestamp()
-
-
-def forecasts(rows, now, save=None, errors=None):
-    newest = {}
-    fresh = []
-    for row in rows:
-        try:
-            serial = row["vehicle"]
-            issued = timestamp(row["time"])
-            if not isinstance(serial, str) or not serial:
-                raise ValueError("Invalid forecast serial")
-            if not -60 <= now - issued <= 1200:
-                continue
-            fresh.append((serial, issued, row))
-            if serial not in newest or issued > newest[serial][0]:
-                newest[serial] = issued, row
-        except (KeyError, TypeError, ValueError, OverflowError):
-            if errors is not None:
-                errors.append(1)
-            continue
-    for serial, issued, row in fresh:
-        try:
-            if row.get("landed") in (1, "1"):
-                continue
-            path = json.loads(row["data"]) if isinstance(row["data"], str) else row["data"]
-            end = path[-1]
-            if "time" in end:
-                eta = float(end["time"])
-                position = point(end["lat"], end["lon"])
-            else:
-                eta = timestamp(end["datetime"])
-                position = point(end["latitude"], end["longitude"])
-            if not math.isfinite(eta) or not issued <= eta <= issued + 86400:
-                raise ValueError("Invalid forecast ETA")
-            if save is not None:
-                save(serial, issued, eta, position, row, path)
-            if eta > now and row is newest[serial][1]:
-                yield serial, position, eta
-        except (KeyError, IndexError, TypeError, ValueError, OverflowError):
-            if errors is not None:
-                errors.append(1)
-            continue
-
-
-def map_url(position):
-    lat, lon = position
-    return f"https://www.openstreetmap.org/?mlat={lat:.6f}&mlon={lon:.6f}#map=16/{lat:.6f}/{lon:.6f}"
-
-
-def landings(rows, history, now, ground, predicted=None):
-    predicted = predicted or {}
-    for serial, frames in rows.items():
-        observations = (frames,) if "datetime" in frames else frames.values()
-        for row in observations:
-            try:
-                observed = timestamp(row["datetime"])
-                if -30 <= now - observed <= 600 and observed > history.get(serial, (0, None))[0]:
-                    history[serial] = observed, row
-            except (KeyError, TypeError, ValueError):
-                continue
-
-    for serial, (observed, row) in list(history.items()):
-        age = now - observed
-        if age > 600:
-            del history[serial]
-            continue
-        try:
-            descent = -float(row["vel_v"])
-            last = point(row["lat"], row["lon"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        if not 1 <= descent <= 100:
-            continue
-        forecast = predicted.get(serial.upper())
-        if forecast:
-            issued, eta, position = forecast
-            km = distance(last, position)
-            if (observed - 1200 <= issued <= observed + 60
-                    and observed - 120 <= eta <= observed + 600 and km <= 1):
-                logging.debug("Touchdown check / %s: %.0f m from forecast, fix age %.0f s, ETA in %.0f s",
-                              serial, km * 1000, age, eta - now)
-                if age >= 60 and now >= eta:
-                    yield serial, position, eta, last, "Likely touchdown"
-                    continue
-                if age < 180:
-                    continue
-                # A late ETA must not block the low-altitude signal-loss fallback.
-                # Otherwise the final fix can expire before the next poll after ETA.
-
-        try:
-            altitude = float(row["alt"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        logging.debug("Signal check / %s: fix age %.0f s, altitude %.0f m, descent %.1f m/s",
-                      serial, age, altitude, descent)
-        if age < 180 or not math.isfinite(altitude) or altitude > SIGNAL_LOSS_MAX_ALTITUDE_M:
-            continue
-
-        try:
-            speed = float(row["vel_h"])
-            heading = float(row["heading"])
-            seconds = (altitude - ground) / descent if ground is not None else math.nan
-            if 0 <= seconds <= 120 and 0 <= speed <= 100 and 0 <= heading <= 360:
-                lat, lon = map(math.radians, last)
-                bearing = math.radians(heading)
-                arc = speed * seconds / 6371000
-                end_lat = math.asin(math.sin(lat) * math.cos(arc)
-                                    + math.cos(lat) * math.sin(arc) * math.cos(bearing))
-                end_lon = lon + math.atan2(math.sin(bearing) * math.sin(arc) * math.cos(lat),
-                                          math.cos(arc) - math.sin(lat) * math.sin(end_lat))
-                position = math.degrees(end_lat), (math.degrees(end_lon) + 180) % 360 - 180
-                yield serial, position, observed + seconds, last
-                continue
-        except (KeyError, TypeError, ValueError):
-            pass
-        yield serial, last, observed, None
-
-
-def prepare_samples(batch, center, archive_radius, start=None, end=None):
-    samples = []
-    invalid = 0
-    for row in batch:
-        try:
-            serial = row["serial"]
-            if not isinstance(serial, str) or not serial:
-                raise ValueError("Invalid telemetry serial")
-            position = point(row["lat"], row["lon"])
-            observed = timestamp(row["datetime"])
-            if (start is not None and observed < start) or (end is not None and observed >= end):
-                continue
-            if distance(center, position) > archive_radius:
-                continue
-            uploader = str(row.get("uploader_callsign") or "")
-            json.dumps(row, allow_nan=False)
-            samples.append((serial.upper(), observed, uploader, row))
-        except (KeyError, TypeError, ValueError, OverflowError):
-            invalid += 1
-    return samples, invalid
-
-
-def in_quiet_hours(current, start, end):
-    if start > end:
-        return current >= start or current < end
-    return start <= current < end
-
-
-def dnd_check(cfg, tz):
-    if not cfg.get("dnd_enabled", False):
-        return lambda: False
-    times = []
-    for option, default in (("dnd_from", "22:00"), ("dnd_to", "07:00")):
-        value = cfg.get(option, default)
-        try:
-            parsed = wall_time.fromisoformat(value)
-            if parsed.strftime("%H:%M") != value:
-                raise ValueError
-        except (TypeError, ValueError):
-            raise ValueError(f"{option} must be a 24-hour time in HH:MM format.") from None
-        times.append(parsed)
-    start, end = times
-    return lambda: in_quiet_hours(datetime.now(tz).time(), start, end)
-
-
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    cfg = json.loads(Path("/data/options.json").read_text(encoding="utf-8"))
+    token = os.environ["SUPERVISOR_TOKEN"]
+    try:
+        cfg = json.loads(app_settings.OPTIONS.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        cfg = {}
     if cfg.get("debug", False):
         logging.getLogger().setLevel(logging.DEBUG)
-    token = os.environ["SUPERVISOR_TOKEN"]
-    entity = cfg["telegram_entity"].strip()
-    if not entity.startswith("notify."):
-        raise ValueError("Set telegram_entity to a Telegram notify.* entity.")
     health = HealthAlerts(cfg.get("health_alerts", True))
-
-    def send(message, photo_url=None):
-        if photo_url:
-            response = request(f"{HA}/services/telegram_bot/send_photo?return_response", token, {
-                "entity_id": entity, "url": photo_url, "caption": f"🎈 {message}", "parse_mode": "plain_text",
-            }, timeout=60)
-        else:
-            response = request(f"{HA}/services/telegram_bot/send_message?return_response", token, {
-                "entity_id": entity, "message": f"🎈 {message}", "parse_mode": "plain_text",
-                "disable_web_page_preview": True,
-            })
-        result = response.get("service_response") if isinstance(response, dict) else None
-        chats = result.get("chats") if isinstance(result, dict) else None
-        if not isinstance(chats, list) or not chats or not isinstance(chats[0], dict):
-            raise RuntimeError("Home Assistant did not confirm Telegram delivery.")
-        return chats
-
-    quiet = lambda: False
+    entity = str(cfg.get("telegram_entity", "")).strip()
+    notifier = None
     try:
-        tz = ZoneInfo(cfg["timezone"])
-        quiet = dnd_check(cfg, tz)
-        run(cfg, token, entity, send, health, tz, quiet)
+        notifier = Notifier(app_settings.parse(cfg), token, health)
+        notifier.run()
     except Exception as error:
         health.fail("Notifier stopped", f"Startup or runtime failure ({error_detail(error)}).", threshold=1)
-        if not quiet():
-            health.flush(send, immediate=True)
+        quiet = notifier.settings.is_quiet() if notifier else False
+        if entity.startswith("notify.") and not quiet:
+            health.flush(lambda message: send_telegram(token, entity, message), immediate=True)
         raise
 
 
-def run(cfg, token, entity, send, health, tz, quiet):
-    sent = json.loads(STATE.read_text()) if STATE.exists() else {}
-    history = {}
-    predicted = {}
-    notify_radius = cfg["radius_km"]
-    archive_radius = cfg.get("archive_radius_km") or notify_radius
-    stream = None
-    bootstrap = True
-    dashboard_state = None
-    dashboard_updated = 0
-    last_center = None
-    try:
-        landing_history.initialize()
-    except (OSError, sqlite3.Error) as error:
-        health.fail("Local archive", f"Database initialization failed ({error_detail(error)}).", threshold=1)
-        raise
-    backfill = Backfill(landing_history.DATABASE, prepare_samples, health)
-    backfill.start()
-    health.healthy("Local archive")
+def send_telegram(token, entity, message, photo_url=None):
+    if photo_url:
+        response = request(f"{HA}/services/telegram_bot/send_photo?return_response", token, {
+            "entity_id": entity, "url": photo_url, "caption": f"🎈 {message}", "parse_mode": "plain_text",
+        }, timeout=60)
+    else:
+        response = request(f"{HA}/services/telegram_bot/send_message?return_response", token, {
+            "entity_id": entity, "message": f"🎈 {message}", "parse_mode": "plain_text",
+            "disable_web_page_preview": True,
+        })
+    result = response.get("service_response") if isinstance(response, dict) else None
+    chats = result.get("chats") if isinstance(result, dict) else None
+    if not isinstance(chats, list) or not chats or not isinstance(chats[0], dict):
+        raise RuntimeError("Home Assistant did not confirm Telegram delivery.")
+    return chats
 
-    def archive_batch(batch, importing=False):
-        center = last_center
+
+class Notifier:
+    def __init__(self, settings, token, health):
+        self.settings = settings
+        self.token = token
+        self.health = health
+        self.entity = settings.telegram_entity
+        self.notify_radius = settings.radius_km
+        self.archive_radius = settings.archive_radius_km
+        self.center = None
+        self.stream = None
+        self.bootstrap = True
+        self.history = {}
+        self.predicted = {}
+        self.dashboard = None
+        self.dashboard_state = None
+        self.dashboard_updated = 0
+        self.test_pending = settings.startup_test
+        self.previous_quiet = False
+        self.started = time.monotonic()
+        self.heartbeat = None
+        self.renderer = self.images = None
+        self.render_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="map-render")
+
+        self.state, problem = AlertState.load(STATE)
+        if problem:
+            self.health.fail("Alert state", f"{problem} Some alerts may be sent twice.", threshold=1)
+
+    # ----- Delivery -----
+
+    def send(self, message, photo_url=None):
+        return send_telegram(self.token, self.entity, message, photo_url)
+
+    def quiet(self):
+        return self.settings.is_quiet()
+
+    def save_alerts(self):
+        try:
+            self.state.save()
+            self.health.healthy("Alert state")
+        except OSError as error:
+            logging.exception("Unable to save alert state")
+            self.health.fail("Alert state", f"Could not save notification state ({error_detail(error)}).", threshold=1)
+
+    # ----- Startup -----
+
+    def start_services(self):
+        try:
+            landing_history.initialize()
+        except (OSError, sqlite3.Error) as error:
+            self.health.fail("Local archive", f"Database initialization failed ({error_detail(error)}).", threshold=1)
+            raise
+        self.backfill = Backfill(landing_history.DATABASE, prepare_samples, self.health)
+        self.backfill.start()
+        self.maintenance = Maintenance(landing_history.DATABASE, self.settings.telemetry_retention_days, self.health)
+        self.maintenance.start()
+        self.health.healthy("Local archive")
+        if self.settings.telegram_map_image:
+            try:
+                import map_image
+                self.map_image = map_image
+                self.renderer = map_image.MapRenderer(self.settings.custom_tile_url,
+                                                      self.settings.custom_tile_attribution)
+                self.images = map_image.ImageServer()
+            except (ImportError, OSError) as error:
+                logging.warning("Telegram map images disabled: %s", error)
+                self.renderer = self.images = None
+        if self.settings.dashboard_sensor:
+            self.dashboard = Dashboard(request, self.token, self.health)
+        landing_history.serve(
+            lambda: self.center, self.archive_radius, self.settings.timezone, map_url, self.recovery_reports,
+            self.notify_radius, self.import_telemetry, self.settings.tiles, health=self.health,
+            backfill=self.backfill, diagnostics=self.diagnostics, maintenance=self.maintenance,
+            heartbeat=self.alive)
+
+    def alive(self):
+        """True while the poll loop keeps completing; drives the Supervisor watchdog."""
+        last = self.heartbeat if self.heartbeat is not None else self.started
+        return time.monotonic() - last < STALL_SECONDS
+
+    # ----- Archive callbacks -----
+
+    def archive_batch(self, batch, importing=False):
+        center = self.center
         if center is None:
             if importing:
                 raise ValueError("Wait for Home Assistant to resolve the configured zone before importing.")
             return 0
-        samples, invalid = prepare_samples(batch, center, archive_radius)
+        samples, invalid = prepare_samples(batch, center, self.archive_radius)
         if not importing:
             if invalid:
-                health.fail("Telemetry parsing", f"{invalid} telemetry records could not be decoded in the latest batch.")
+                self.health.fail("Telemetry parsing", f"{invalid} telemetry records could not be decoded in the latest batch.")
             elif batch:
-                health.healthy("Telemetry parsing")
+                self.health.healthy("Telemetry parsing")
         try:
             added = landing_history.record_telemetry(samples)
             if samples:
-                health.healthy("Raw telemetry archive")
+                self.health.healthy("Raw telemetry archive")
             return added
         except sqlite3.Error as error:
-            health.fail("Raw telemetry archive", f"Could not save GPS samples ({error_detail(error)}).", threshold=1)
+            self.health.fail("Raw telemetry archive", f"Could not save GPS samples ({error_detail(error)}).", threshold=1)
             if importing:
                 raise
             logging.exception("Unable to archive telemetry batch")
             return 0
 
-    def import_telemetry(serial):
-        return archive_batch(fetch_archive(serial), importing=True)
+    def import_telemetry(self, serial):
+        return self.archive_batch(fetch_archive(serial), importing=True)
 
+    @staticmethod
     def recovery_reports(serials):
         query = urlencode({"serial": ",".join(serials), "last": 0})
         return request(f"{API}/recovered?{query}")
 
-    tiles = {"style": "https://tiles.openfreemap.org/styles/liberty"} if cfg.get("map_default_basemap", True) else None
-    tile_url = cfg.get("map_tile_url", "").strip()
-    tile_attribution = cfg.get("map_tile_attribution", "").strip()
-    if tile_url:
-        try:
-            parsed = urlsplit(tile_url)
-            if parsed.scheme != "https" or not parsed.hostname or not tile_attribution or not all(
-                part in tile_url for part in ("{z}", "{x}", "{y}")
-            ):
-                raise ValueError
-            tiles = {"url": tile_url, "attribution": escape(tile_attribution)}
-        except ValueError:
-            logging.warning("Custom basemap ignored: configure an HTTPS tile URL with {z}, {x}, {y} and attribution.")
-    renderer = images = None
-    if cfg.get("telegram_map_image", True):
-        try:
-            import map_image
-            custom = tiles is not None and "url" in tiles
-            renderer = map_image.MapRenderer(tile_url if custom else None, tile_attribution if custom else None)
-            images = map_image.ImageServer()
-        except (ImportError, OSError) as error:
-            logging.warning("Telegram map images disabled: %s", error)
-            renderer = images = None
+    # ----- Map images -----
 
-    def map_photo(serial, kind, position, last_fix, center):
-        if renderer is None:
+    def render(self, *args, **kwargs):
+        """Render a map with an overall deadline, so slow tile servers cannot stall polling."""
+        future = self.render_pool.submit(self.renderer.render, *args, **kwargs)
+        try:
+            return future.result(timeout=MAP_RENDER_TIMEOUT_SECONDS)
+        except FutureTimeout:
+            future.cancel()
+            raise TimeoutError(f"Map rendering exceeded {MAP_RENDER_TIMEOUT_SECONDS} s") from None
+
+    def map_photo(self, serial, kind, position, last_fix, center):
+        if self.renderer is None:
             return None
         try:
-            track = map_image.read_track(landing_history.DATABASE, serial, time.time() - 1800)
+            track = self.map_image.read_track(landing_history.DATABASE, serial, time.time() - 1800)
         except sqlite3.Error as error:
             logging.debug("Map track for %s unavailable: %s", serial, error)
             track = []
         try:
-            png = renderer.render(position, last_fix, track, center, kind)
+            png = self.render(position, last_fix, track, center, kind)
         except (OSError, ValueError) as error:
             logging.warning("Map image for %s could not be rendered: %s", serial, error)
             return None
-        return images.publish(png)
+        return self.images.publish(png)
 
-    def send_alert(message, serial, kind, position, last_fix, center):
+    def send_alert(self, message, serial, kind, position, last_fix, center):
         """Send with a map image when possible; fall back to a text message."""
-        photo_url = map_photo(serial, kind, position, last_fix, center)
+        photo_url = self.map_photo(serial, kind, position, last_fix, center)
         if photo_url:
             try:
-                return send(message, photo_url), True
+                return self.send(message, photo_url), True
             except TimeoutError:
                 raise  # The photo may still arrive; a text fallback could duplicate the alert.
             except (OSError, ValueError, RuntimeError) as error:
                 logging.warning("Telegram map photo for %s failed, sending text: %s", serial, error)
             finally:
-                images.discard(photo_url)
-        return send(message), False
+                self.images.discard(photo_url)
+        return self.send(message), False
 
-    def diagnostics(action):
+    # ----- Diagnostics -----
+
+    def diagnostics(self, action):
         if action == "telegram":
-            if quiet():
+            if self.quiet():
                 return [("Telegram", "Waiting", "Do Not Disturb is active. Try again after quiet hours.")]
             try:
-                send("Sonde Tools · diagnostics test message")
-            except (OSError, EOFError, TypeError, ValueError, RuntimeError) as error:
+                self.send("Sonde Tools · diagnostics test message")
+            except DELIVERY_ERRORS as error:
                 logging.warning("Diagnostics Telegram test: %s", error)
                 return [("Telegram", "Failed", error_detail(error))]
             return [("Telegram", "Passed", "Home Assistant confirmed delivery to the configured chat.")]
         if action == "telegram_map":
-            if renderer is None:
-                reason = ("telegram_map_image is disabled." if not cfg.get("telegram_map_image", True)
-                          else "The map renderer could not start. Check the app log.")
-                return [("Telegram map", "Failed", reason)]
-            if last_center is None:
-                return [("Telegram map", "Waiting", "The configured zone has not been resolved yet.")]
-            if quiet():
-                return [("Telegram map", "Waiting", "Do Not Disturb is active. Try again after quiet hours.")]
-            try:
-                png = renderer.render(last_center, label="Test position · zone center")
-            except (OSError, ValueError) as error:
-                logging.warning("Diagnostics map render: %s", error)
-                return [("Map rendering", "Failed", error_detail(error))]
-            results = [("Map rendering", "Passed", f"Rendered a {len(png) / 1024:.0f} KB PNG from map tiles.")]
-            photo_url = images.publish(png)
-            try:
-                send("Sonde Tools · diagnostics map test\n"
-                     f"Zone center {map_url(last_center)}", photo_url)
-                results.append(("Telegram map", "Passed", "Home Assistant downloaded the image and confirmed delivery."))
-            except (OSError, EOFError, TypeError, ValueError, RuntimeError) as error:
-                logging.warning("Diagnostics Telegram map test: %s", error)
-                results.append(("Telegram map", "Failed", error_detail(error)))
-            finally:
-                images.discard(photo_url)
-            return results
+            return self.diagnose_map()
+        return self.diagnose_integrations()
 
+    def diagnose_map(self):
+        if self.renderer is None:
+            reason = ("telegram_map_image is disabled." if not self.settings.telegram_map_image
+                      else "The map renderer could not start. Check the app log.")
+            return [("Telegram map", "Failed", reason)]
+        if self.center is None:
+            return [("Telegram map", "Waiting", "The configured zone has not been resolved yet.")]
+        if self.quiet():
+            return [("Telegram map", "Waiting", "Do Not Disturb is active. Try again after quiet hours.")]
+        try:
+            png = self.render(self.center, label="Test position · zone center")
+        except (OSError, ValueError) as error:
+            logging.warning("Diagnostics map render: %s", error)
+            return [("Map rendering", "Failed", error_detail(error))]
+        results = [("Map rendering", "Passed", f"Rendered a {len(png) / 1024:.0f} KB PNG from map tiles.")]
+        photo_url = self.images.publish(png)
+        try:
+            self.send("Sonde Tools · diagnostics map test\n"
+                      f"Zone center {map_url(self.center)}", photo_url)
+            results.append(("Telegram map", "Passed", "Home Assistant downloaded the image and confirmed delivery."))
+        except DELIVERY_ERRORS as error:
+            logging.warning("Diagnostics Telegram map test: %s", error)
+            results.append(("Telegram map", "Failed", error_detail(error)))
+        finally:
+            self.images.discard(photo_url)
+        return results
+
+    def diagnose_integrations(self):
         results = []
-        ready, age = stream.status() if stream is not None else (False, None)
+        ready, age = self.stream.status() if self.stream is not None else (False, None)
         if ready and age is not None and age <= 120:
             results.append(("SondeHub WebSocket", "Passed", f"Last valid GPS batch arrived {age:.0f} seconds ago."))
         else:
             results.append(("SondeHub WebSocket", "Waiting", "No recent valid GPS batch. Check the app log for reconnects."))
         try:
-            zone = request(f"{HA}/states/{quote(cfg['zone'], safe='.')}", token, timeout=6)["attributes"]
-            point(zone["latitude"], zone["longitude"])
-            results.append(("Home Assistant zone", "Passed", f"{cfg['zone']} has valid coordinates."))
+            self.resolve_zone(timeout=6)
+            results.append(("Home Assistant zone", "Passed", f"{self.settings.zone} has valid coordinates."))
         except (OSError, EOFError, KeyError, TypeError, ValueError) as error:
             results.append(("Home Assistant zone", "Failed", error_detail(error)))
         try:
@@ -434,69 +321,47 @@ def run(cfg, token, entity, send, health, tz, quiet):
             results.append(("Local archive", "Passed", "SQLite is readable and a write transaction can start."))
         except sqlite3.Error as error:
             results.append(("Local archive", "Failed", error_detail(error)))
+        if self.dashboard is not None:
+            mode = self.dashboard.mode
+            connected = mode == "rest" or self.dashboard.connected
+            results.append(("Dashboard sensor", "Passed" if connected else "Waiting",
+                            "Published with MQTT discovery." if mode == "mqtt" and connected else
+                            "Waiting for the MQTT broker." if mode == "mqtt" else
+                            "Published with the REST API (MQTT integration not found)."))
         return results
 
-    landing_history.serve(lambda: last_center, archive_radius, tz, map_url, recovery_reports,
-                          notify_radius, import_telemetry, tiles, health=health, backfill=backfill, diagnostics=diagnostics)
+    # ----- Alerts -----
 
-    def save_alerts():
-        temp = STATE.with_suffix(".tmp")
-        try:
-            temp.write_text(json.dumps(sent))
-            temp.replace(STATE)
-            health.healthy("Alert state")
-        except OSError as error:
-            logging.exception("Unable to save alert state")
-            health.fail("Alert state", f"Could not save notification state ({error_detail(error)}).", threshold=1)
-
-    def alert(kind, candidate, center, now):
+    def alert(self, kind, candidate, center, now):
         serial, position, when, *last_fix = candidate
         key = f"{kind}/{serial}"
         if last_fix and last_fix[0] is None:
             kind = "Signal lost during descent"
         details = f"Last GPS fix: {map_url(last_fix[0])}\n" if last_fix and last_fix[0] else ""
         km = distance(center, position)
-        if km <= archive_radius:
+        if km <= self.archive_radius:
             archive_kind = "Last GPS fix" if kind == "Signal lost during descent" else kind
             try:
                 landing_history.record(serial, archive_kind, now, when, position, km, last_fix[0] if last_fix else None)
-                health.healthy("Landing event archive")
+                self.health.healthy("Landing event archive")
             except sqlite3.Error as error:
                 logging.exception("Unable to archive event for %s", serial)
-                health.fail("Landing event archive", f"Could not save landing events ({error_detail(error)}).", threshold=1)
-        if quiet():
-            logging.debug("%s / %s muted by quiet hours", kind, serial)
-            return
-        inside = km <= notify_radius
-        previous = sent.get(key)
+                self.health.fail("Landing event archive", f"Could not save landing events ({error_detail(error)}).", threshold=1)
+        inside = km <= self.notify_radius
+        previous = self.state.sent.get(key)
+        tz = self.settings.timezone
         eta = datetime.fromtimestamp(when, tz).strftime("%Y-%m-%d %H:%M %Z")
         title = last_fix[1] if len(last_fix) > 1 else kind
+        if self.quiet():
+            if inside and previous is None and key not in self.state.muted:
+                self.state.muted[key] = {"at": now, "line": f"{title} · {serial} · {km:.1f} km · {eta}\n{map_url(position)}"}
+                self.save_alerts()
+            logging.debug("%s / %s muted by quiet hours", kind, serial)
+            return
         message = (f"{title} · {serial}\nDistance {km:.1f} km\nTime {eta}\n"
                    f"{map_url(position)}\n{details}https://sondehub.org/{quote(serial, safe='')}")
         if isinstance(previous, dict):
-            moved = distance(previous["position"], position)
-            crossed = previous["inside"] != inside
-            if previous["entity"] == entity and (crossed or moved >= 1):
-                status = ("Entered" if inside else "Left") + " the Telegram radius" if crossed else (
-                    "Inside the Telegram radius" if inside else "Outside the Telegram radius"
-                )
-                text = f"🎈 {message}\nForecast updated · {status} · moved {moved:.1f} km"
-                if previous.get("photo"):
-                    # Telegram cannot turn a photo caption into a text message, and
-                    # Home Assistant has no media edit service, so only the caption changes.
-                    request(f"{HA}/services/telegram_bot/edit_caption", token, {
-                        "entity_id": entity, "message_id": previous["message_id"],
-                        "caption": f"{text}\nMap shows the first forecast position.",
-                    })
-                else:
-                    request(f"{HA}/services/telegram_bot/edit_message", token, {
-                        "entity_id": entity, "message_id": previous["message_id"], "message": text,
-                        "parse_mode": "plain_text", "disable_web_page_preview": True,
-                    })
-                health.healthy("Telegram delivery")
-                previous.update(position=position, inside=inside)
-                save_alerts()
-                logging.info("Forecast message updated: %s / %s", serial, status)
+            self.update_forecast_message(key, previous, message, position, inside, serial)
             return
         if not inside:
             logging.debug("%s / %s skipped Telegram: %.1f km is outside the notification radius", kind, serial, km)
@@ -504,174 +369,264 @@ def run(cfg, token, entity, send, health, tz, quiet):
         if previous is not None:
             logging.debug("%s / %s skipped: already alerted", kind, serial)
             return
-        chats, photo = send_alert(message, serial, title, position, last_fix[0] if last_fix else None, center)
-        health.healthy("Telegram delivery")
+        chats, photo = self.send_alert(message, serial, title, position, last_fix[0] if last_fix else None, center)
+        self.health.healthy("Telegram delivery")
         message_id = chats[0].get("message_id")
-        sent[key] = now
+        self.state.muted.pop(key, None)
+        self.state.sent[key] = now
         if kind == "Predicted landing" and isinstance(message_id, int):
-            sent[key] = {"at": now, "entity": entity, "message_id": message_id,
-                         "position": position, "inside": inside, "photo": photo}
-        save_alerts()
+            self.state.sent[key] = {"at": now, "entity": self.entity, "message_id": message_id,
+                                    "position": list(position), "inside": inside, "photo": photo, "edit_failures": 0}
+        self.save_alerts()
         logging.info("Alert sent: %s / %s", kind, serial)
 
-    test_pending = cfg["startup_test"]
-    previous_quiet = False
-    while True:
-        muted = quiet()
-        if muted != previous_quiet:
-            logging.info("Telegram quiet hours %s", "started" if muted else "ended")
-            previous_quiet = muted
+    def update_forecast_message(self, key, previous, message, position, inside, serial):
+        if not self.state.editable(key, self.entity):
+            return
+        moved = distance(previous["position"], position)
+        crossed = previous["inside"] != inside
+        if not (crossed or moved >= 1):
+            return
+        status = ("Entered" if inside else "Left") + " the Telegram radius" if crossed else (
+            "Inside the Telegram radius" if inside else "Outside the Telegram radius"
+        )
+        text = f"🎈 {message}\nForecast updated · {status} · moved {moved:.1f} km"
         try:
-            zone = request(f"{HA}/states/{quote(cfg['zone'], safe='.')}", token)["attributes"]
-            center = point(zone["latitude"], zone["longitude"])
-            if center != last_center:
-                logging.debug("Polling every %s seconds within %.1f km of %s (%.6f, %.6f)",
-                              POLL_INTERVAL_SECONDS, cfg["radius_km"], cfg["zone"], *center)
-                last_center = center
-            if stream is None:
-                stream = TelemetryStream(API, archive_batch)
-            health.healthy("Home Assistant zone")
-        except (OSError, EOFError, KeyError, TypeError, ValueError, RuntimeError) as error:
-            logging.warning("Home Assistant zone: %s", error)
-            health.fail("Home Assistant zone", f"Cannot resolve the configured zone ({error_detail(error)}).")
-            if not quiet():
-                health.flush(send)
-            time.sleep(POLL_INTERVAL_SECONDS)
-            continue
-        if test_pending and not quiet():
-            try:
-                send("Sonde Tools · test message")
-                test_pending = False
-                health.healthy("Telegram delivery")
-            except (OSError, EOFError, TypeError, ValueError, RuntimeError) as error:
-                logging.warning("Telegram test message: %s", error)
-                health.fail("Telegram delivery", f"Test message failed ({error_detail(error)}).", threshold=1)
+            if previous["photo"]:
+                # Telegram cannot turn a photo caption into a text message, and
+                # Home Assistant has no media edit service, so only the caption changes.
+                request(f"{HA}/services/telegram_bot/edit_caption", self.token, {
+                    "entity_id": self.entity, "message_id": previous["message_id"],
+                    "caption": f"{text}\nMap shows the first forecast position.",
+                })
+            else:
+                request(f"{HA}/services/telegram_bot/edit_message", self.token, {
+                    "entity_id": self.entity, "message_id": previous["message_id"], "message": text,
+                    "parse_mode": "plain_text", "disable_web_page_preview": True,
+                })
+        except DELIVERY_ERRORS:
+            abandoned = self.state.edit_failed(key)
+            self.save_alerts()
+            if abandoned:
+                logging.warning("Forecast message for %s could not be edited repeatedly; it may have been "
+                                "deleted. Further updates for this flight are skipped.", serial)
+            raise
+        previous.update(position=list(position), inside=inside, edit_failures=0)
+        self.health.healthy("Telegram delivery")
+        self.save_alerts()
+        logging.info("Forecast message updated: %s / %s", serial, status)
 
+    def send_quiet_summary(self):
+        """After quiet hours, report the alerts that were held back, in one message."""
+        if not self.state.muted:
+            return
+        if not self.settings.dnd_summary:
+            self.state.muted.clear()
+            self.save_alerts()
+            return
+        held = sorted(self.state.muted.items(), key=lambda item: item[1]["at"])
+        lines = [entry["line"] for _, entry in held[:10]]
+        if len(held) > 10:
+            lines.append(f"…and {len(held) - 10} more. See the history page.")
         try:
-            forecast_rows = request(f"{API}/predictions?vehicles=")
-            if not isinstance(forecast_rows, list):
+            self.send("Sonde Tools · during quiet hours\n" + "\n".join(lines))
+        except DELIVERY_ERRORS as error:
+            logging.warning("Quiet hours summary pending (%s)", error_detail(error))
+            self.health.fail("Telegram delivery", f"Quiet hours summary failed ({error_detail(error)}).", threshold=1)
+            return
+        self.health.healthy("Telegram delivery")
+        for key, entry in held:
+            # Treat held alerts as delivered so the summary is not followed by duplicates.
+            self.state.sent.setdefault(key, entry["at"])
+        self.state.muted.clear()
+        self.save_alerts()
+        logging.info("Quiet hours summary sent (%s alerts)", len(held))
+
+    # ----- Polling -----
+
+    def resolve_zone(self, timeout=20):
+        zone = request(f"{HA}/states/{quote(self.settings.zone, safe='.')}", self.token, timeout=timeout)["attributes"]
+        return point(zone["latitude"], zone["longitude"])
+
+    def load_forecasts(self):
+        try:
+            rows = request(f"{API}/predictions?vehicles=")
+            if not isinstance(rows, list):
                 raise ValueError("Expected a list of forecasts")
-            health.healthy("SondeHub forecasts")
+            self.health.healthy("SondeHub forecasts")
+            return rows
         except (OSError, EOFError, ValueError) as exc:
             logging.warning("SondeHub (Predicted landing): %s", exc)
-            forecast_rows = None
-            health.fail("SondeHub forecasts", f"Could not load landing forecasts ({error_detail(exc)}).")
+            self.health.fail("SondeHub forecasts", f"Could not load landing forecasts ({error_detail(exc)}).")
+            return None
 
-        now = time.time()
-        predicted = {serial: forecast for serial, forecast in predicted.items() if now - forecast[0] <= 1800}
-        sent = {key: value for key, value in sent.items()
-                if now - (value["at"] if isinstance(value, dict) else value) < WEEK}
-        query = urlencode({"lat": center[0], "lon": center[1],
-                           "distance": round(max(notify_radius, archive_radius) * 1000) + 12000, "last": 600})
-        ready, streamed = stream.drain()
+    def load_telemetry(self, center):
+        ready, streamed = self.stream.drain()
         if ready:
-            health.healthy("Live telemetry stream")
+            self.health.healthy("Live telemetry stream")
         else:
-            health.fail("Live telemetry stream", "No valid WebSocket batches are arriving. REST snapshots cannot capture every GPS fix.")
-        if bootstrap or not ready:
+            self.health.fail("Live telemetry stream", "No valid WebSocket batches are arriving. REST snapshots cannot capture every GPS fix.")
+        if self.bootstrap or not ready:
+            query = urlencode({"lat": center[0], "lon": center[1],
+                               "distance": round(max(self.notify_radius, self.archive_radius) * 1000) + 12000,
+                               "last": 600})
             try:
                 nearby = request(f"{API}/sondes?{query}")
                 if not isinstance(nearby, dict) or any(not isinstance(row, dict) for row in nearby.values()):
                     raise ValueError("Expected a telemetry object keyed by serial")
-                archive_batch(nearby.values())
+                self.archive_batch(nearby.values())
                 for serial, row in nearby.items():
                     if serial not in streamed or row.get("datetime", "") > streamed[serial]["datetime"]:
                         streamed[serial] = row
-                bootstrap = False
-                health.healthy("REST telemetry")
+                self.bootstrap = False
+                self.health.healthy("REST telemetry")
             except (OSError, EOFError, AttributeError, ValueError) as exc:
                 logging.warning("SondeHub telemetry fallback: %s", exc)
-                health.fail("REST telemetry", f"Could not load fallback GPS data ({error_detail(exc)}).")
+                self.health.fail("REST telemetry", f"Could not load fallback GPS data ({error_detail(exc)}).")
                 if not ready:
-                    streamed = None
+                    return None
+        if ready and not self.bootstrap:
+            self.health.healthy("REST telemetry")
+        return streamed
 
-        if ready and not bootstrap:
-            health.healthy("REST telemetry")
+    def process(self, center, now, forecast_rows, streamed):
         snapshots = []
         forecast_errors = []
 
         def save_forecast(serial, issued, eta, position, row, path):
-            nearby = distance(center, position) <= archive_radius
+            nearby = distance(center, position) <= self.archive_radius
             if not nearby:
                 try:
                     origin = point(row["latitude"], row["longitude"])
-                    nearby = distance(center, origin) <= archive_radius
+                    nearby = distance(center, origin) <= self.archive_radius
                 except (KeyError, TypeError, ValueError):
                     pass
             serial = serial.upper()
-            if serial not in predicted or issued > predicted[serial][0]:
-                predicted[serial] = issued, eta, position
+            if serial not in self.predicted or issued > self.predicted[serial][0]:
+                self.predicted[serial] = issued, eta, position
             snapshots.append((serial, issued, eta, *position, path, nearby, serial, issued - 1200))
 
         sources = [
             ("Predicted landing", forecast_rows, lambda rows: forecasts(rows, now, save_forecast, forecast_errors)),
             ("Estimated landing after signal loss", streamed,
-             lambda rows: landings(rows, history, now, cfg.get("ground_elevation_m"), predicted)),
+             lambda rows: landings(rows, self.history, now, self.settings.ground_elevation_m, self.predicted)),
         ]
         for kind, rows, candidates in sources:
+            if rows is None:
+                continue
             try:
-                if rows is None:
-                    continue
                 matches = list(candidates(rows))
-                health.healthy(f"{kind} processing")
+                self.health.healthy(f"{kind} processing")
                 if kind == "Predicted landing":
-                    if forecast_errors:
-                        health.fail("Forecast parsing", f"{len(forecast_errors)} forecasts could not be decoded in the latest poll.")
-                    else:
-                        health.healthy("Forecast parsing")
-                    try:
-                        landing_history.record_forecasts(snapshots)
-                        if snapshots:
-                            health.healthy("Forecast archive")
-                    except sqlite3.Error as error:
-                        health.fail("Forecast archive", f"Could not save forecast paths ({error_detail(error)}).", threshold=1)
-                        logging.exception("Unable to archive forecast snapshots")
+                    self.archive_forecasts(snapshots, forecast_errors)
                 logging.debug("%s: %s records, %s candidates", kind, len(rows), len(matches))
                 for candidate in matches:
                     try:
-                        alert(kind, candidate, center, now)
-                    except (OSError, ValueError, RuntimeError) as exc:
+                        self.alert(kind, candidate, center, now)
+                    except (OSError, EOFError, KeyError, TypeError, ValueError, RuntimeError) as exc:
                         logging.warning("Alert delivery failed (%s): %s", candidate[0], exc)
-                        health.fail("Telegram delivery", f"A sonde alert or edit failed ({error_detail(exc)}).", threshold=1)
+                        self.health.fail("Telegram delivery", f"A sonde alert or edit failed ({error_detail(exc)}).", threshold=1)
             except (OSError, EOFError, AttributeError, TypeError, ValueError) as exc:
                 logging.warning("SondeHub (%s): %s", kind, exc)
-                health.fail(f"{kind} processing", f"Could not process SondeHub data ({error_detail(exc)}).")
-        if cfg.get("dashboard_sensor"):
-            active = []
-            for serial, (observed, row) in history.items():
-                if not -30 <= now - observed <= 180:
-                    continue
-                try:
-                    km = distance(center, point(row["lat"], row["lon"]))
-                    if km <= archive_radius:
-                        active.append((km, serial, observed, row))
-                except (KeyError, TypeError, ValueError):
-                    continue
-            state = {"state": "No active sonde", "attributes": {
-                "friendly_name": "Nearest active radiosonde", "icon": "mdi:weather-windy",
-            }}
-            if active:
-                km, serial, observed, row = min(active, key=lambda item: item[0])
-                forecast = predicted.get(serial.upper())
-                state["state"] = serial
-                state["attributes"].update(
-                    distance_km=round(km, 1), altitude_m=row.get("alt"),
-                    gps_fix=datetime.fromtimestamp(observed, tz).isoformat(),
-                    forecast_eta=datetime.fromtimestamp(forecast[1], tz).isoformat() if forecast and forecast[1] > now else None,
-                    sondehub_url=f"https://sondehub.org/{quote(serial, safe='')}",
-                )
-            if state != dashboard_state or now - dashboard_updated >= 300:
-                try:
-                    request(f"{HA}/states/sensor.sonde_tools_nearest_active", token, state)
-                    dashboard_state, dashboard_updated = state, now
-                    health.healthy("Home Assistant dashboard sensor")
-                except (OSError, ValueError) as exc:
-                    logging.warning("Home Assistant dashboard sensor: %s", exc)
-                    health.fail("Home Assistant dashboard sensor", f"Could not publish sensor state ({error_detail(exc)}).")
-        health.healthy("Notifier stopped")
-        if not quiet():
-            health.flush(send)
-        time.sleep(POLL_INTERVAL_SECONDS)
+                self.health.fail(f"{kind} processing", f"Could not process SondeHub data ({error_detail(exc)}).")
+
+    def archive_forecasts(self, snapshots, forecast_errors):
+        if forecast_errors:
+            self.health.fail("Forecast parsing", f"{len(forecast_errors)} forecasts could not be decoded in the latest poll.")
+        else:
+            self.health.healthy("Forecast parsing")
+        try:
+            landing_history.record_forecasts(snapshots)
+            if snapshots:
+                self.health.healthy("Forecast archive")
+        except sqlite3.Error as error:
+            self.health.fail("Forecast archive", f"Could not save forecast paths ({error_detail(error)}).", threshold=1)
+            logging.exception("Unable to archive forecast snapshots")
+
+    def update_dashboard(self, center, now):
+        if self.dashboard is None:
+            return
+        tz = self.settings.timezone
+        active = []
+        for serial, (observed, row) in self.history.items():
+            if not -30 <= now - observed <= 180:
+                continue
+            try:
+                km = distance(center, point(row["lat"], row["lon"]))
+                if km <= self.archive_radius:
+                    active.append((km, serial, observed, row))
+            except (KeyError, TypeError, ValueError):
+                continue
+        state = {"state": "No active sonde", "attributes": {
+            "friendly_name": "Nearest active radiosonde", "icon": "mdi:weather-windy",
+        }}
+        if active:
+            km, serial, observed, row = min(active, key=lambda item: item[0])
+            forecast = self.predicted.get(serial.upper())
+            state["state"] = serial
+            state["attributes"].update(
+                distance_km=round(km, 1), altitude_m=row.get("alt"),
+                gps_fix=datetime.fromtimestamp(observed, tz).isoformat(),
+                forecast_eta=datetime.fromtimestamp(forecast[1], tz).isoformat() if forecast and forecast[1] > now else None,
+                sondehub_url=f"https://sondehub.org/{quote(serial, safe='')}",
+            )
+        if state != self.dashboard_state or now - self.dashboard_updated >= 300:
+            try:
+                self.dashboard.publish(state)
+                self.dashboard_state, self.dashboard_updated = state, now
+            except (OSError, ValueError, EOFError) as exc:
+                logging.warning("Home Assistant dashboard sensor: %s", exc)
+                self.health.fail("Home Assistant dashboard sensor", f"Could not publish sensor state ({error_detail(exc)}).")
+
+    def poll(self):
+        """Run one polling cycle. Returns False when the zone could not be resolved."""
+        muted = self.quiet()
+        if muted != self.previous_quiet:
+            logging.info("Telegram quiet hours %s", "started" if muted else "ended")
+            self.previous_quiet = muted
+        try:
+            center = self.resolve_zone()
+            if center != self.center:
+                logging.debug("Polling every %s seconds within %.1f km of %s (%.6f, %.6f)",
+                              POLL_INTERVAL_SECONDS, self.notify_radius, self.settings.zone, *center)
+                self.center = center
+            if self.stream is None:
+                self.stream = TelemetryStream(API, self.archive_batch)
+            self.health.healthy("Home Assistant zone")
+        except (OSError, EOFError, KeyError, TypeError, ValueError, RuntimeError) as error:
+            logging.warning("Home Assistant zone: %s", error)
+            self.health.fail("Home Assistant zone", f"Cannot resolve the configured zone ({error_detail(error)}).")
+            return False
+        if self.test_pending and not muted:
+            try:
+                self.send("Sonde Tools · test message")
+                self.test_pending = False
+                self.health.healthy("Telegram delivery")
+            except DELIVERY_ERRORS as error:
+                logging.warning("Telegram test message: %s", error)
+                self.health.fail("Telegram delivery", f"Test message failed ({error_detail(error)}).", threshold=1)
+
+        forecast_rows = self.load_forecasts()
+        now = time.time()
+        self.predicted = {serial: forecast for serial, forecast in self.predicted.items() if now - forecast[0] <= 1800}
+        self.state.prune(now)
+        streamed = self.load_telemetry(center)
+        self.process(center, now, forecast_rows, streamed)
+        if not muted:
+            # After processing, so alerts that are still current go out in full and leave the summary.
+            self.send_quiet_summary()
+        self.update_dashboard(center, now)
+        self.health.healthy("Notifier stopped")
+        return True
+
+    def run(self):
+        self.start_services()
+        while True:
+            self.poll()
+            self.heartbeat = time.monotonic()
+            if not self.quiet():
+                self.health.flush(self.send)
+            time.sleep(POLL_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":

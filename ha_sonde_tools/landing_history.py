@@ -7,8 +7,8 @@ import time
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
-from html import escape
 from hmac import compare_digest
+from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from secrets import token_urlsafe
@@ -16,14 +16,19 @@ from threading import Thread
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
-import field_tools
-from flight_distance import read_distances, chart as distance_chart
-from app_version import APP_VERSION
 import archive_storage as archive
+import field_tools
+from app_version import APP_VERSION
+from flight_distance import chart as distance_chart
+from flight_distance import read_distances
 from health_alerts import error_detail
 
 DATABASE = "/data/history.sqlite3"
-INTERFACE_CSS = Path(__file__).with_name("interface.css").read_text(encoding="utf-8")
+WEB = Path(__file__).with_name("web")
+INTERFACE_CSS = (WEB / "interface.css").read_text(encoding="utf-8")
+SCRIPTS = {path.name: path.read_text(encoding="utf-8") for path in WEB.glob("*.js")}
+# Writers wait longer than readers so a running VACUUM or backfill does not drop live telemetry.
+WRITE_TIMEOUT = 30
 WEEK = 7 * 86400
 COLORS = {
     "Predicted landing": "#2465d0",
@@ -48,6 +53,11 @@ ICONS = {
     "diagnostics": '<path d="M3 12h4l3-6 4 12 3-6h4M4 4h16v16H4z"/>',
     "database": '<ellipse cx="12" cy="5" rx="7" ry="3"/><path d="M5 5v7c0 2 3 3 7 3s7-1 7-3V5M5 12v7c0 2 3 3 7 3s7-1 7-3v-7"/>',
 }
+
+
+def script(name):
+    """Inline a bundled script from web/ (ingress pages are served from a single route)."""
+    return "<script>\n" + SCRIPTS[name] + "</script>"
 
 
 def icon(name):
@@ -92,7 +102,7 @@ def initialize():
 
 def record_telemetry(samples):
     if samples:
-        with closing(sqlite3.connect(DATABASE)) as db, db:
+        with closing(sqlite3.connect(DATABASE, timeout=WRITE_TIMEOUT)) as db, db:
             db.execute("BEGIN IMMEDIATE")
             return archive.write_packets(db, samples)
     return 0
@@ -101,7 +111,7 @@ def record_telemetry(samples):
 def record_forecasts(samples):
     if not samples:
         return
-    with closing(sqlite3.connect(DATABASE)) as db, db:
+    with closing(sqlite3.connect(DATABASE, timeout=WRITE_TIMEOUT)) as db, db:
         for serial, issued, eta, latitude, longitude, route, nearby, _, since in samples:
             inserted = db.execute("""
                 INSERT OR IGNORE INTO forecasts (serial, issued, eta, latitude, longitude)
@@ -319,7 +329,7 @@ def sync_recoveries(fetch_reports, health=None):
                         statuses[serial] = "Recovery planned", reported, None, None
                     elif report.get("recovered") is False:
                         statuses[serial] = "Attempt unsuccessful", reported, None, None
-                with closing(sqlite3.connect(DATABASE)) as db, db:
+                with closing(sqlite3.connect(DATABASE, timeout=WRITE_TIMEOUT)) as db, db:
                     db.executemany("""
                         INSERT OR REPLACE INTO recovery (serial, status, checked, reported, latitude, longitude)
                         VALUES (?, ?, ?, ?, ?, ?)
@@ -335,7 +345,7 @@ def sync_recoveries(fetch_reports, health=None):
 
 
 def record(serial, kind, now, when, position, distance_km, last_fix):
-    with closing(sqlite3.connect(DATABASE)) as db, db:
+    with closing(sqlite3.connect(DATABASE, timeout=WRITE_TIMEOUT)) as db, db:
         db.execute("""
             INSERT INTO events
                 (serial, kind, recorded, event_time, latitude, longitude, distance_km, last_lat, last_lon)
@@ -505,50 +515,7 @@ def recovery_view(serial, terrain, tz, map_url, tiles):
 <p><button id="location-button" type="button">Show distance and bearing</button></p>
 <p id="location-result" role="status">Location access is optional and stays in this browser.</p>
 <script type="application/json" id="recovery-target">{data}</script>
-""" + """
-<script>
-(() => {
-    const button = document.getElementById("location-button");
-    const result = document.getElementById("location-result");
-    const target = JSON.parse(document.getElementById("recovery-target").textContent);
-    let watch = null;
-    function stop() {
-        if (watch === null) return;
-        navigator.geolocation.clearWatch(watch);
-        watch = null;
-        button.textContent = "Show distance and bearing";
-    }
-    button.addEventListener("click", () => {
-        if (watch !== null) {
-            stop();
-            result.textContent = "Location sharing stopped.";
-            return;
-        }
-        if (!navigator.geolocation || !window.isSecureContext) {
-            result.textContent = "Location requires HTTPS and browser permission. Navigation links remain available.";
-            return;
-        }
-        button.textContent = "Stop using location";
-        watch = navigator.geolocation.watchPosition(({coords}) => {
-            const rad = Math.PI / 180;
-            const a = coords.latitude * rad;
-            const b = target[0] * rad;
-            const lon = (target[1] - coords.longitude) * rad;
-            const h = Math.sin((b - a) / 2) ** 2 + Math.cos(a) * Math.cos(b) * Math.sin(lon / 2) ** 2;
-            const km = 12742 * Math.asin(Math.min(1, Math.sqrt(h)));
-            const bearing = Math.atan2(Math.sin(lon) * Math.cos(b),
-                Math.cos(a) * Math.sin(b) - Math.sin(a) * Math.cos(b) * Math.cos(lon));
-            result.textContent = (km < 1 ? Math.round(km * 1000) + " m" : km.toFixed(2) + " km") +
-                " · bearing " + ((Math.round(bearing / rad) + 360) % 360) + "° · GPS ±" +
-                Math.round(coords.accuracy) + " m";
-        }, () => {
-            stop();
-            result.textContent = "Location unavailable. Check browser permissions or use the navigation link.";
-        }, {enableHighAccuracy: true, maximumAge: 10000, timeout: 15000});
-    });
-    window.addEventListener("pagehide", stop);
-})();
-</script>"""
+""" + script("recovery.js")
 
 
 def landing_heatmap(query, tz):
@@ -766,502 +733,7 @@ def full_map(rows, center, radius, timezone, map_url, notify_radius, tiles=None,
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
  integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
 {vector_assets}
-""" + """
-<script>
-(() => {
-    const container = document.getElementById("full-map");
-    if (!window.L) {
-        if (!container.children.length) {
-            container.textContent = "The interactive map could not load. The History tab still has map links.";
-        }
-        return;
-    }
-    const {center, radius, notifyRadius, events, tiles, compact, flight, heatmap, corridor} = JSON.parse(document.getElementById("map-data").textContent);
-    container.replaceChildren();
-    const start = flight?.tracks[0]?.latest.position || flight?.forecasts.at(-1)?.position || center || heatmap?.[0]?.position || corridor?.[0]?.[0] || events[0].position;
-    const map = L.map(container, {preferCanvas: true, scrollWheelZoom: !compact}).setView(start, 10);
-    const status = document.getElementById("basemap-status");
-    const unavailable = "Basemap unavailable. Event markers and search circles are still shown.";
-    if (tiles && tiles.style) {
-        try {
-            if (!L.maplibreGL || !window.maplibregl) throw new Error("MapLibre unavailable");
-            const layer = L.maplibreGL({
-                style: tiles.style,
-                attributionControl: {customAttribution: '<a href="https://openfreemap.org/">OpenFreeMap</a> · ' +
-                    '<a href="https://openmaptiles.org/">OpenMapTiles</a> · ' +
-                    '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'}
-            }).addTo(map);
-            const vectorMap = layer.getMaplibreMap();
-            vectorMap.on("error", () => { status.textContent = unavailable; });
-            vectorMap.on("load", () => { status.textContent = ""; });
-        } catch (error) {
-            status.textContent = unavailable;
-        }
-    } else if (tiles) {
-        const layer = L.tileLayer(tiles.url, {
-            maxZoom: 19, attribution: tiles.attribution, referrerPolicy: "strict-origin-when-cross-origin"
-        });
-        layer.once("tileerror", () => {
-            layer.remove();
-            status.textContent = unavailable;
-        });
-        layer.addTo(map);
-    } else {
-        status.textContent = "No basemap configured. Select an event marker to open its street map.";
-    }
-    const bounds = L.latLngBounds(events.map(event => event.position));
-    if (center && !flight) {
-        const circle = L.circle(center, {radius, weight: 2, fillOpacity: 0.06}).addTo(map);
-        bounds.extend(circle.getBounds());
-        if (notifyRadius !== radius) {
-            const notify = L.circle(center, {radius: notifyRadius, dashArray: "6 5", fill: false}).addTo(map);
-            bounds.extend(notify.getBounds());
-        }
-    }
-    if (bounds.isValid()) map.fitBounds(bounds, {padding: [24, 24], maxZoom: 15});
-    document.addEventListener("DOMContentLoaded", () => {
-        map.invalidateSize({pan: false});
-        if (compact && bounds.isValid()) map.fitBounds(bounds, {padding: [24, 24], maxZoom: 15});
-    }, {once: true});
-    function sondeMarker(position, color, glyph, popup, destination) {
-        const badge = document.createElement("div");
-        badge.className = "map-pin-badge";
-        badge.style.setProperty("--pin-color", color);
-        const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-        svg.setAttribute("viewBox", "0 0 24 24");
-        svg.setAttribute("fill", "none");
-        svg.setAttribute("stroke", "currentColor");
-        svg.setAttribute("stroke-width", "2");
-        svg.setAttribute("stroke-linecap", "round");
-        svg.setAttribute("stroke-linejoin", "round");
-        const path = document.createElementNS(svg.namespaceURI, "path");
-        const shapes = {
-            sonde: "M12 3a6 6 0 0 0-6 6c0 4 4 7 6 9 2-2 6-5 6-9a6 6 0 0 0-6-6ZM10 18h4l1 3H9l1-3Z",
-            target: "M12 4a8 8 0 1 0 0 16 8 8 0 0 0 0-16Zm0 5v6m-3-3h6",
-            found: "m5 12 4 4L19 6",
-            fix: "M19 10c0 4-7 10-7 10S5 14 5 10a7 7 0 1 1 14 0Zm-7-2v4",
-        };
-        path.setAttribute("d", shapes[glyph]);
-        svg.append(path);
-        badge.append(svg);
-        const pin = L.divIcon({className: "map-pin", html: badge, iconSize: [28, 28], iconAnchor: [14, 14], popupAnchor: [0, -12]});
-        return L.marker(position, {icon: pin, title: popup.textContent}).bindPopup(popup).addTo(destination);
-    }
-
-    function appendPositionLinks(popup, serial, position, osmUrl) {
-        const links = document.createElement("div");
-        const googleQuery = new URLSearchParams({api: "1", query: position.join(",")});
-        const destinations = [
-            ["SondeHub", "https://sondehub.org/" + encodeURIComponent(serial)],
-            ["Google Maps", "https://www.google.com/maps/search/?" + googleQuery],
-            ["Flight", "?" + new URLSearchParams({tab: "flight", serial})],
-            ["Recovery Mode", "?" + new URLSearchParams({tab: "recovery", serial})]
-        ];
-        if (osmUrl) destinations.push(["OpenStreetMap", osmUrl]);
-        for (const [label, url] of destinations) {
-            const link = document.createElement("a");
-            link.href = url;
-            link.target = "_blank";
-            link.rel = "noopener noreferrer";
-            link.textContent = label;
-            links.append(link, document.createTextNode(" "));
-        }
-        popup.append(links);
-    }
-
-    function showAltitudeProfile(track) {
-        const svg = document.getElementById("altitude-profile");
-        const slider = document.getElementById("profile-index");
-        const caption = document.getElementById("profile-caption");
-        const fixes = track?.profile.filter(fix => fix.altitude != null && Number.isFinite(Number(fix.altitude))) || [];
-        if (!fixes.length) {
-            svg.hidden = true;
-            document.getElementById("profile-control").hidden = true;
-            caption.textContent = "No archived altitude data.";
-            return;
-        }
-        const first = fixes[0];
-        const last = fixes.at(-1);
-        const peak = fixes.reduce((highest, fix) => Number(fix.altitude) > Number(highest.altitude) ? fix : highest);
-        const low = fixes.reduce((min, fix) => Math.min(min, Number(fix.altitude)), Number(first.altitude));
-        const x = fix => 24 + 592 * (fix.observed - first.observed) / Math.max(1, last.observed - first.observed);
-        const y = fix => 134 - 108 * (Number(fix.altitude) - low) / Math.max(1, Number(peak.altitude) - low);
-        const make = (tag, attrs) => {
-            const element = document.createElementNS("http://www.w3.org/2000/svg", tag);
-            for (const [name, value] of Object.entries(attrs)) element.setAttribute(name, value);
-            svg.append(element);
-            return element;
-        };
-        make("path", {d: "M24 20V134H616", stroke: "currentColor", opacity: ".35", fill: "none"});
-        let path = "";
-        let previous = null;
-        for (const fix of fixes) {
-            const gap = previous && fix.observed - previous.observed > 300;
-            path += (previous && !gap ? "L" : "M") + x(fix) + "," + y(fix);
-            if (gap) make("line", {x1: x(fix), x2: x(fix), y1: 24, y2: 134,
-                stroke: "currentColor", opacity: ".35", "stroke-dasharray": "4 4"});
-            previous = fix;
-        }
-        make("path", {d: path, stroke: "#7851c8", "stroke-width": 3, fill: "none"});
-        const peakIndex = fixes.indexOf(peak);
-        const labels = [
-            [peak, fixes.slice(peakIndex + 1).some(fix => Number(fix.verticalSpeed) < -1) ? "Possible burst" : "Highest fix"],
-            [last, "Last fix"]
-        ];
-        for (const [fix, label] of labels) {
-            make("circle", {cx: x(fix), cy: y(fix), r: 4, fill: "#7851c8"});
-            const text = make("text", {x: x(fix), y: fix === last ? 155 : 15, fill: "currentColor",
-                "text-anchor": x(fix) > 480 ? "end" : "start", "font-size": 12});
-            text.textContent = label;
-        }
-        const cursor = make("circle", {r: 5, fill: "#c82568"});
-        const marker = L.circleMarker(last.position, {color: "#c82568", radius: 6}).addTo(map);
-        slider.max = fixes.length - 1;
-        slider.value = fixes.length - 1;
-        const selectFix = index => {
-            const fix = fixes[index];
-            if (!fix) {
-                marker.remove();
-                cursor.setAttribute("visibility", "hidden");
-                caption.textContent = "No observed fix yet";
-                return;
-            }
-            if (!map.hasLayer(marker)) marker.addTo(map);
-            marker.setLatLng(fix.position);
-            cursor.removeAttribute("visibility");
-            cursor.setAttribute("cx", x(fix));
-            cursor.setAttribute("cy", y(fix));
-            caption.textContent = new Date(fix.observed * 1000).toLocaleString() + " · " + fix.altitude + " m";
-        };
-        slider.addEventListener("input", () => selectFix(Number(slider.value)));
-        svg.addEventListener("click", event => {
-            const bounds = svg.getBoundingClientRect();
-            const clicked = (event.clientX - bounds.left) * 640 / bounds.width;
-            const best = fixes.reduce((index, fix, i) => Math.abs(x(fix) - clicked) < Math.abs(x(fixes[index]) - clicked) ? i : index, 0);
-            slider.value = best;
-            selectFix(best);
-        });
-        selectFix(fixes.length - 1);
-        return {fixes, burst: labels[0][1] === "Possible burst" ? peak.observed : null,
-            select(index) { slider.value = Math.max(0, index); selectFix(index); }};
-    }
-
-    if (flight) {
-        let latest = flight.latest;
-        function showFlightCard() {
-            const card = document.getElementById("flight-card");
-            if (!latest) {
-                card.textContent = "No observed GPS fix.";
-                return;
-            }
-            const now = Date.now() / 1000;
-            const age = Math.max(0, Math.round(now - latest.observed));
-            const speed = latest.verticalSpeed == null ? null : Number(latest.verticalSpeed);
-            const motion = speed == null || !Number.isFinite(speed) ? "Motion unknown" :
-                speed > 1 ? "Ascending" : speed < -1 ? "Descending" : "Low vertical speed";
-            const parts = [age <= 180 ? motion : "Last known · " + motion];
-            if (latest.altitude != null) parts.push(latest.altitude + " m altitude");
-            if (speed != null && Number.isFinite(speed)) parts.push(speed.toFixed(1) + " m/s vertical");
-            if (center) parts.push((map.distance(center, latest.position) / 1000).toFixed(1) + " km from zone center");
-            if (latest.forecastEta > now) parts.push("ETA " + new Date(latest.forecastEta * 1000).toLocaleString());
-            parts.push("GPS fix " + (age < 120 ? age + " s" : Math.floor(age / 60) + " min") + " ago");
-            card.textContent = parts.join(" · ");
-        }
-        showFlightCard();
-        window.setInterval(showFlightCard, 1000);
-        let refreshing = false;
-        window.setInterval(async () => {
-            if (document.hidden || refreshing) return;
-            refreshing = true;
-            try {
-                const query = new URLSearchParams({latest: "1", serial: flight.serial});
-                const response = await fetch("?" + query, {cache: "no-store"});
-                if (response.ok) {
-                    latest = await response.json();
-                    showFlightCard();
-                }
-            } catch (error) {
-                // Keep the last fix and let its age continue to update.
-            } finally {
-                refreshing = false;
-            }
-        }, 30000);
-
-        const observed = L.latLngBounds([]);
-        const track = flight.tracks[0];
-        if (track) {
-            for (const segment of track.segments) {
-                L.polyline(segment, {color: "#7851c8", weight: 3}).addTo(map);
-                observed.extend(L.latLngBounds(segment));
-            }
-            const popup = document.createElement("div");
-            popup.textContent = "Last observed GPS fix";
-            appendPositionLinks(popup, flight.serial, track.latest.position);
-            L.circleMarker(track.latest.position, {color: "#7851c8"}).bindPopup(popup).addTo(map);
-            if (flight.limited) {
-                document.getElementById("track-status").textContent = "Showing the newest 12,000 observed route points.";
-            }
-        }
-        const profile = showAltitudeProfile(track);
-        if (flight.recovery) {
-            const popup = document.createElement("div");
-            popup.textContent = "Reported recovery";
-            appendPositionLinks(popup, flight.serial, flight.recovery);
-            sondeMarker(flight.recovery, "#008678", "found", popup, map);
-            observed.extend(flight.recovery);
-        }
-        if (observed.isValid()) map.fitBounds(observed, {padding: [24, 24], maxZoom: 15});
-        const slider = document.getElementById("forecast-snapshot");
-        let selectForecast = () => {};
-        if (slider) {
-            const caption = document.getElementById("forecast-caption");
-            const predicted = L.layerGroup().addTo(map);
-            const drift = L.layerGroup().addTo(map);
-            const spread = L.layerGroup().addTo(map);
-            L.control.layers({}, {"Forecast spread": spread}).addTo(map);
-            const scoring = flight.recovery ? flight.forecasts.filter(forecast => forecast.score) : [];
-            const bestError = scoring.reduce((best, forecast) =>
-                Math.min(best, map.distance(forecast.position, flight.recovery)), Infinity);
-            let selected = 0;
-            async function showForecast(fit) {
-                const request = ++selected;
-                const index = Number(slider.value);
-                const forecast = flight.forecasts[index];
-                caption.textContent = forecast.label + " · ETA " + forecast.eta;
-                drift.clearLayers();
-                spread.clearLayers();
-                const earlier = [];
-                for (let i = index - 1; i >= 0; i--) {
-                    if (flight.forecasts[i + 1].issued - flight.forecasts[i].issued > 7200) break;
-                    earlier.unshift(flight.forecasts[i]);
-                }
-                for (const snapshot of earlier) {
-                    const dot = L.circleMarker(snapshot.position, {radius: 3, color: "#2465d0", opacity: 0.45, fillOpacity: 0.35});
-                    const label = document.createElement("span");
-                    label.textContent = snapshot.label;
-                    dot.bindTooltip(label).addTo(drift);
-                }
-                const recent = earlier.find(snapshot => forecast.issued - snapshot.issued <= 1200);
-                const recentPositions = earlier.filter(snapshot => forecast.issued - snapshot.issued <= 1200);
-                if (recentPositions.length) {
-                    const spreadRadius = recentPositions.reduce((largest, snapshot) =>
-                        Math.max(largest, map.distance(snapshot.position, forecast.position)), 0);
-                    if (spreadRadius > 0) {
-                        L.circle(forecast.position, {radius: spreadRadius, color: "#2465d0", weight: 1,
-                            fillOpacity: 0.12}).bindTooltip("Forecast spread (not a confidence area)").addTo(spread);
-                        caption.textContent += " · Spread " + (spreadRadius / 1000).toFixed(2) + " km";
-                    }
-                }
-                if (recent) {
-                    const delta = map.distance(recent.position, forecast.position);
-                    const radians = Math.PI / 180;
-                    const a = recent.position[0] * radians;
-                    const b = forecast.position[0] * radians;
-                    const lon = (forecast.position[1] - recent.position[1]) * radians;
-                    const bearing = Math.atan2(Math.sin(lon) * Math.cos(b),
-                        Math.cos(a) * Math.sin(b) - Math.sin(a) * Math.cos(b) * Math.cos(lon));
-                    const direction = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"][
-                        (Math.round(bearing / radians / 45) + 8) % 8];
-                    const minutes = Math.max(1, Math.round((forecast.issued - recent.issued) / 60));
-                    caption.textContent += " · Drift " + (delta / 1000).toFixed(1) + " km" +
-                        (delta >= 50 ? " " + direction : "") + " over " + minutes + " min";
-                }
-                if (forecast.score) {
-                    caption.textContent += " · " + (map.distance(forecast.position, flight.recovery) / 1000).toFixed(2) +
-                        " km from reported recovery (best " + (bestError / 1000).toFixed(2) + " km)";
-                }
-                predicted.clearLayers();
-                const popup = document.createElement("div");
-                popup.textContent = "Predicted landing · " + forecast.eta;
-                appendPositionLinks(popup, flight.serial, forecast.position);
-                sondeMarker(forecast.position, "#2465d0", "target", popup, predicted);
-                const visible = L.latLngBounds([forecast.position]);
-                if (observed.isValid()) visible.extend(observed);
-                if (forecast.hasPath) {
-                    try {
-                        const query = new URLSearchParams({path: "1", serial: flight.serial, issued: forecast.issued});
-                        const response = await fetch("?" + query);
-                        if (!response.ok) throw new Error("Forecast path unavailable");
-                        const segments = await response.json();
-                        if (request !== selected) return;
-                        for (const segment of segments) {
-                            L.polyline(segment, {color: "#2465d0", weight: 3, dashArray: "6 5"}).addTo(predicted);
-                            visible.extend(L.latLngBounds(segment));
-                        }
-                    } catch (error) {
-                        if (request !== selected) return;
-                        caption.textContent += " · Route unavailable";
-                    }
-                } else {
-                    caption.textContent += " · Landing point only";
-                }
-                if (fit) map.fitBounds(visible, {padding: [24, 24], maxZoom: 15});
-            }
-            selectForecast = index => {
-                if (index < 0) {
-                    selected++;
-                    predicted.clearLayers();
-                    drift.clearLayers();
-                    spread.clearLayers();
-                    caption.textContent = "No forecast issued yet";
-                } else {
-                    slider.value = index;
-                    showForecast(false);
-                }
-            };
-            slider.addEventListener("input", () => showForecast(false));
-            showForecast(true);
-        }
-
-        const moments = [...new Set([...(profile?.fixes.map(fix => fix.observed) || []),
-                                     ...flight.forecasts.map(forecast => forecast.issued)])].sort((a, b) => a - b);
-        const play = document.getElementById("replay-button");
-        const replayTime = document.getElementById("replay-time");
-        if (moments.length > 1) {
-            play.hidden = false;
-            let timer = null;
-            let step = 0;
-            let fixIndex = -2;
-            let forecastIndex = -2;
-            function pause(label) {
-                window.clearInterval(timer);
-                timer = null;
-                play.textContent = label;
-            }
-            function advance() {
-                const at = moments[step++];
-                replayTime.textContent = new Date(at * 1000).toLocaleString();
-                if (profile) {
-                    const index = profile.fixes.findLastIndex(fix => fix.observed <= at);
-                    if (index !== fixIndex) profile.select(index);
-                    fixIndex = index;
-                }
-                const index = flight.forecasts.findLastIndex(forecast => forecast.issued <= at);
-                if (index !== forecastIndex) selectForecast(index);
-                forecastIndex = index;
-                if (step === moments.length) {
-                    pause("Replay flight");
-                } else if (at === profile?.burst) {
-                    pause("Resume after possible burst");
-                }
-            }
-            play.addEventListener("click", () => {
-                if (timer !== null) {
-                    pause("Resume flight");
-                    return;
-                }
-                if (step === moments.length) step = 0;
-                fixIndex = -2;
-                forecastIndex = -2;
-                play.textContent = "Pause flight";
-                timer = window.setInterval(advance, 500);
-                advance();
-            });
-        }
-    }
-    if (corridor) {
-        const footprint = L.latLngBounds([]);
-        for (const route of corridor) {
-            L.polyline(route, {color: "#008678", weight: 3, opacity: 0.65}).addTo(map);
-            L.circleMarker(route.at(-1), {color: "#008678", radius: 4}).addTo(map);
-            footprint.extend(L.latLngBounds(route));
-        }
-        L.circleMarker(corridor[0][0], {color: "#c82568", radius: 6}).bindTooltip("Last GPS fix").addTo(map);
-        map.fitBounds(footprint, {padding: [24, 24], maxZoom: 17});
-    }
-    if (heatmap) {
-        const largest = heatmap.reduce((max, cell) => Math.max(max, cell.count), 1);
-        for (const cell of heatmap) {
-            const weight = Math.sqrt(cell.count / largest);
-            const popup = document.createElement("span");
-            popup.textContent = cell.label || cell.count + (cell.count === 1 ? " location" : " locations") + " in this grid cell";
-            L.circle(cell.position, {radius: 2800, stroke: Boolean(cell.lastHeard), color: "#b32e37", weight: 2, fillColor: weight > 0.65 ? "#d43b36" : "#f39a23",
-                fillOpacity: 0.16 + 0.64 * weight}).bindPopup(popup).addTo(map);
-        }
-        if (heatmap.length && !center) {
-            map.fitBounds(L.latLngBounds(heatmap.map(cell => cell.position)), {padding: [24, 24], maxZoom: 12});
-        }
-    }
-    const landingMarkers = L.layerGroup().addTo(map);
-    let displayedEvents;
-    renderLandingMarkers(events);
-
-    if (!compact && !flight && !heatmap && !corridor) {
-        const trackStatus = document.getElementById("track-status");
-        const routes = L.layerGroup().addTo(map);
-        const livePositions = L.layerGroup().addTo(map);
-        const query = new URLSearchParams(window.location.search);
-        query.set("tracks", "1");
-        query.set("map_events", "1");
-        let updating = false;
-        async function refreshTracks() {
-            if (updating || document.hidden) return;
-            updating = true;
-            try {
-                const response = await fetch("?" + query.toString(), {cache: "no-store"});
-                if (!response.ok) throw new Error("Track request failed");
-                const {tracks, limited, events: freshEvents} = await response.json();
-                if (freshEvents) renderLandingMarkers(freshEvents);
-                const count = document.getElementById("map-event-count");
-                if (count && freshEvents) count.textContent = freshEvents.length;
-                routes.clearLayers();
-                livePositions.clearLayers();
-                let liveCount = 0;
-                for (const track of tracks) {
-                    const label = document.createElement("span");
-                    label.textContent = track.serial;
-                    for (const segment of track.segments) {
-                        if (segment.length < 2) continue;
-                        L.polyline(segment, {color: "#7851c8", weight: 3, opacity: 0.8})
-                            .bindTooltip(label.cloneNode(true)).addTo(routes);
-                    }
-                    if (!track.latest.live) continue;
-                    liveCount++;
-                    const popup = document.createElement("div");
-                    const time = new Date(track.latest.observed * 1000).toLocaleString();
-                    const altitude = track.latest.altitude == null ? "" : " · " + track.latest.altitude + " m";
-                    popup.textContent = track.serial + " · GPS fix " + time + altitude;
-                    appendPositionLinks(popup, track.serial, track.latest.position);
-                    sondeMarker(track.latest.position, "#c82568", "sonde", popup, livePositions);
-                }
-                trackStatus.textContent = liveCount + " live positions · " + tracks.length + " archived tracks" +
-                    (limited ? " · Showing the newest 12,000 track points. Narrow the filters for older points." : "");
-            } catch (error) {
-                livePositions.clearLayers();
-                trackStatus.textContent = "Track refresh failed. Displayed routes may be out of date.";
-            } finally {
-                updating = false;
-            }
-        }
-        L.control.layers({}, {"Observed routes": routes, "Live positions": livePositions}).addTo(map);
-        refreshTracks();
-        window.setInterval(refreshTracks, 30000);
-        document.addEventListener("visibilitychange", refreshTracks);
-    }
-
-    function renderLandingMarkers(items) {
-        const signature = JSON.stringify(items);
-        if (signature === displayedEvents) return;
-        displayedEvents = signature;
-        landingMarkers.clearLayers();
-        for (const event of items) {
-            const popup = document.createElement("div");
-            const title = document.createElement("strong");
-            title.textContent = event.serial;
-            popup.append(title);
-            for (const value of [event.kind, event.status, event.time].filter(Boolean)) {
-                const line = document.createElement("div");
-                line.textContent = value;
-                popup.append(line);
-            }
-            appendPositionLinks(popup, event.serial, event.position, event.mapUrl);
-            const glyph = event.status === "Recovered" ? "found" : event.kind === "Predicted landing" ? "target" :
-                event.kind === "Latest saved GPS fix" ? "sonde" : "fix";
-            sondeMarker(event.position, event.color, glyph, popup, landingMarkers);
-        }
-    }
-})();
-</script>"""
+""" + script("map.js")
 
 
 @lru_cache(maxsize=4)
@@ -1368,6 +840,34 @@ Imported GPS samples appear in Flight, Full map, and Coverage.</p>
 </form>"""
 
 
+def maintenance_view(maintenance, token):
+    if maintenance is None:
+        return ""
+    status = maintenance.status()
+    days = status["retention_days"]
+    retention = (f"GPS fixes and forecast paths older than <strong>{days} days</strong> are removed every six hours. "
+                 "Landing events and recovery reports are kept."
+                 if days else "Raw telemetry is kept until removed. Set <code>telemetry_retention_days</code> to limit it.")
+    if status["running"]:
+        state = f"<p><strong>{escape(status['running'])} in progress.</strong></p>"
+    elif status["compact_requested"]:
+        state = "<p><strong>Compaction queued.</strong></p>"
+    elif status["last"]:
+        finished, summary = status["last"]
+        state = f"<p>Last run: {escape(summary)} ({datetime.fromtimestamp(finished, timezone.utc):%Y-%m-%d %H:%M} UTC).</p>"
+    else:
+        state = ""
+    busy = status["running"] or status["compact_requested"]
+    button = ("" if busy else
+              f'<form class="form-row" method="post"><input type="hidden" name="token" value="{escape(token)}">'
+              '<button name="maintenance_action" value="compact">Compact database</button></form>')
+    refresh = ('<script>window.setTimeout(() => { if (!document.hidden) location.reload(); }, 10000);</script>'
+               if busy else "")
+    return (f'<h2 class="section-title">{icon("database")}Archive maintenance</h2><p>{retention}</p>'
+            "<p>Compaction rewrites the database to return freed space to the disk. It can take several minutes "
+            "on a large archive; new telemetry waits while it runs.</p>" + state + button + refresh)
+
+
 def diagnostics_view(token, results):
     checks = "".join(
         f'<tr><td>{escape(name)}</td><td><strong>{escape(status)}</strong></td><td>{escape(detail)}</td></tr>'
@@ -1387,7 +887,8 @@ def diagnostics_view(token, results):
     )
 
 
-def history_page(query, center, radius, timezone, map_url, notify_radius=None, import_token="", tiles=None, backfill=None, diagnostic_results=None):
+def history_page(query, center, radius, timezone, map_url, notify_radius=None, import_token="", tiles=None, backfill=None,
+                 diagnostic_results=None, maintenance=None):
     notify_radius = radius if notify_radius is None else notify_radius
     period = query.get("days", ["30"])[0]
     periods = {"7": "7 days", "30": "30 days", "365": "1 year", "0": "All history"}
@@ -1512,7 +1013,7 @@ def history_page(query, center, radius, timezone, map_url, notify_radius=None, i
     if active_tab == "scorecard":
         content = scorecard_view()
     if active_tab == "backfill":
-        content = backfill_view(backfill, center, radius, import_token)
+        content = backfill_view(backfill, center, radius, import_token) + maintenance_view(maintenance, import_token)
     if active_tab == "diagnostics":
         content = diagnostics_view(import_token, diagnostic_results)
     serial_form = "" if analytical else f"""<form class="form-row card" method="get"><input type="hidden" name="tab" value="{active_tab}">{date_filter}
@@ -1527,20 +1028,7 @@ def history_page(query, center, radius, timezone, map_url, notify_radius=None, i
             raise
         count, footprint = "Archive unavailable", ""
     view = content if active_tab == "history" else f'<section class="card">{content}</section>'
-    panel_link = """
-<script>
-try {
-    if (window.parent !== window && !location.search) {
-        const serial = new URLSearchParams(window.parent.location.search).get("sonde_tools_flight");
-        if (serial && /^[A-Za-z0-9_-]{1,80}$/.test(serial)) {
-            location.replace("?" + new URLSearchParams({tab: "flight", serial}));
-        }
-    }
-} catch (error) {
-    // An iframe on another origin cannot inspect its parent.
-}
-</script>
-""" if active_tab == "history" else ""
+    panel_link = script("history.js") if active_tab == "history" else ""
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Sonde Tools · {active_tab.title()}</title>
@@ -1577,7 +1065,8 @@ try {
 </div></body></html>"""
 
 
-def serve(center, radius, timezone, map_url, fetch_reports, notify_radius, import_telemetry, tiles=None, health=None, backfill=None, diagnostics=None):
+def serve(center, radius, timezone, map_url, fetch_reports, notify_radius, import_telemetry, tiles=None, health=None,
+          backfill=None, diagnostics=None, maintenance=None, heartbeat=None, port=8099):
     import_token = token_urlsafe(32)
 
     class Handler(BaseHTTPRequestHandler):
@@ -1607,13 +1096,24 @@ def serve(center, radius, timezone, map_url, fetch_reports, notify_radius, impor
                     return
                 results = diagnostics(diagnostic_action)
                 body = history_page({"tab": ["diagnostics"]}, center(), radius, timezone, map_url,
-                                    notify_radius, import_token, tiles, backfill, results).encode()
+                                    notify_radius, import_token, tiles, backfill, results, maintenance).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Cache-Control", "no-store")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+                return
+            if form.get("maintenance_action") == ["compact"] and maintenance:
+                try:
+                    maintenance.request_compact()
+                except ValueError as error:
+                    self.send_error(409, str(error))
+                    return
+                self.send_response(303)
+                self.send_header("Location", "?tab=backfill")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
                 return
             action = form.get("backfill_action", [""])[0]
             if action and backfill:
@@ -1668,6 +1168,17 @@ def serve(center, radius, timezone, map_url, fetch_reports, notify_radius, impor
             self.wfile.write(body)
 
         def do_GET(self):
+            if urlsplit(self.path).path == "/health":
+                # Polled by the Supervisor watchdog; reveals only whether the poll loop is running.
+                healthy = heartbeat is None or heartbeat()
+                body = b"ok" if healthy else b"stalled"
+                self.send_response(200 if healthy else 503)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if self.client_address[0] != "172.30.32.2":
                 self.send_error(403)
                 return
@@ -1710,7 +1221,8 @@ def serve(center, radius, timezone, map_url, fetch_reports, notify_radius, impor
                         return
                     body = read_telemetry(serial)
                 else:
-                    body = history_page(query, center(), radius, timezone, map_url, notify_radius, import_token, tiles, backfill).encode()
+                    body = history_page(query, center(), radius, timezone, map_url, notify_radius, import_token, tiles,
+                                        backfill, maintenance=maintenance).encode()
             except sqlite3.Error as error:
                 if health:
                     health.fail("History database", f"Could not read local history ({error_detail(error)}).", threshold=1)
@@ -1732,6 +1244,7 @@ def serve(center, radius, timezone, map_url, fetch_reports, notify_radius, impor
             self.end_headers()
             self.wfile.write(body)
 
-    server = ThreadingHTTPServer(("", 8099), Handler)
+    server = ThreadingHTTPServer(("", port), Handler)
     Thread(target=server.serve_forever, daemon=True).start()
     Thread(target=sync_recoveries, args=(fetch_reports, health), daemon=True).start()
+    return server
