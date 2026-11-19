@@ -1,0 +1,24 @@
+[project]
+name = "ha-sonde-tools"
+requires-python = ">=3.13"
+# Runtime dependencies are pinned in ha_sonde_tools/requirements.txt (installed by the Dockerfile).
+
+[tool.ruff]
+target-version = "py313"
+line-length = 160
+src = ["ha_sonde_tools"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "I"]
+ignore = [
+    "E501",  # SQL, HTML, and log messages are kept on one line for searchability.
+    "E731",  # Short lambdas are used for callbacks.
+    "B905",  # zip() is used on sequences built to equal length.
+]
+
+[tool.ruff.lint.isort]
+known-first-party = [
+    "alert_state", "app_version", "archive_storage", "backfill", "dashboard", "detection", "field_tools",
+    "flight_distance", "health_alerts", "landing_history", "maintenance", "map_image", "notifier", "settings",
+    "telemetry_stream",
+]
