@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.15.1
+
+### Added
+- `mqtt_host`, `mqtt_port`, `mqtt_username`, `mqtt_password`, and `mqtt_ssl` connect the dashboard sensor and live entities to an external MQTT broker. Before, only a broker app advertised by the Supervisor (such as Mosquitto) was found.
+
 ## 0.15.0
 
 ### Added
