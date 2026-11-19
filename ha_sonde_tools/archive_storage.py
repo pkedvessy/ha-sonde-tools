@@ -201,16 +201,33 @@ def initialize_summaries(db):
     """)
     db.execute("CREATE INDEX IF NOT EXISTS flight_summaries_first ON flight_summaries(first_observed)")
     name = "flight_summaries_v1"
-    if db.execute("SELECT 1 FROM archive_migrations WHERE name=?", (name,)).fetchone():
-        return
-    # One-time fill from the fixes still present; fixes already removed by retention cannot be recovered.
-    db.execute(f"""
-        INSERT OR REPLACE INTO flight_summaries
-        SELECT serial, min(observed), max(observed), count(*), max({summary_sql("alt")}),
-               max({summary_sql("vel_h")}), min({summary_sql("vel_v")}), min({summary_sql("temp")}), max(type)
-        FROM telemetry_fixes GROUP BY serial
-    """)
-    db.execute("INSERT INTO archive_migrations VALUES (?)", (name,))
+    if not db.execute("SELECT 1 FROM archive_migrations WHERE name=?", (name,)).fetchone():
+        # One-time fill from the fixes still present; fixes already removed by retention cannot be recovered.
+        db.execute(f"""
+            INSERT OR REPLACE INTO flight_summaries
+                (serial, first_observed, last_observed, fixes, max_alt, max_speed, min_vertical, min_temp, type)
+            SELECT serial, min(observed), max(observed), count(*), max({summary_sql("alt")}),
+                   max({summary_sql("vel_h")}), min({summary_sql("vel_v")}), min({summary_sql("temp")}), max(type)
+            FROM telemetry_fixes GROUP BY serial
+        """)
+        db.execute("INSERT INTO archive_migrations VALUES (?)", (name,))
+    # Whole-track statistics, recomputed in the background by flight_stats. New columns default to
+    # dirty = 1, so existing flights are filled in gradually after an upgrade.
+    existing = {row[1] for row in db.execute("PRAGMA table_info(flight_summaries)")}
+    for column, kind in DERIVED_COLUMNS:
+        if column not in existing:
+            db.execute(f"ALTER TABLE flight_summaries ADD COLUMN {column} {kind}")
+    db.execute("CREATE INDEX IF NOT EXISTS flight_summaries_dirty ON flight_summaries(dirty) WHERE dirty = 1")
+
+
+DERIVED_COLUMNS = (
+    ("first_lat", "REAL"), ("first_lon", "REAL"), ("first_alt", "REAL"),
+    ("last_lat", "REAL"), ("last_lon", "REAL"), ("last_alt", "REAL"),
+    ("track_km", "REAL"), ("straight_km", "REAL"), ("bearing", "REAL"),
+    ("burst_observed", "REAL"), ("max_ascent", "REAL"), ("speed_alt", "REAL"),
+    ("receivers", "INTEGER"), ("frequency", "REAL"), ("subtype", "TEXT"),
+    ("dirty", "INTEGER NOT NULL DEFAULT 1"),
+)
 
 
 def _limited(value, column):
@@ -252,7 +269,8 @@ def write_summaries(db, summaries):
             min_vertical = CASE WHEN min_vertical IS NULL OR excluded.min_vertical < min_vertical
                                 THEN excluded.min_vertical ELSE min_vertical END,
             min_temp = CASE WHEN min_temp IS NULL OR excluded.min_temp < min_temp THEN excluded.min_temp ELSE min_temp END,
-            type = coalesce(type, excluded.type)
+            type = coalesce(type, excluded.type),
+            dirty = 1
     """, ((serial, *entry) for serial, entry in summaries.items()))
 
 

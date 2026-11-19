@@ -218,7 +218,8 @@ The summary lists the burst altitude, freezing level, tropopause (WMO lapse-rate
 The **Records** tab summarizes a calendar year, a single month of a year (both in the app time zone), or all time. Pick the year and optionally the month. A month view charts flights and landings by day and names the busiest day instead of drawing the year calendar. The month is ignored with **All time**:
 
 - Flights archived, saved GPS fixes, landings near you, and how many of them were reported recovered.
-- Records: highest altitude, fastest wind ride, fastest descent, coldest reading, longest archived track, and closest landing. Each links to the flight.
+- Records: highest altitude, fastest wind ride, fastest descent, coldest reading, longest track, farthest drift, longest flight time, most receivers, and closest landing. Each links to the flight.
+- A **Flights** table with one row per sonde: date, type, highest altitude, fastest wind, track length, straight-line distance, flight time, and receivers. Select a column heading to sort by it. The top 100 rows are shown.
 - Flights and landings per month (or per year for all time), a day-by-day flight calendar, landing times by hour of day, and sonde types.
 
 Records come from flight summaries. A summary is kept for every archived serial and updated as fixes arrive (live or by Backfill), so records and counts stay complete when `telemetry_retention_days` removes the raw fixes. A flight belongs to the year of its first archived fix. Summaries are limited to fixes inside the archive radius. On upgrade, existing archives are summarized once from the fixes still present; flights already removed by retention cannot be recovered.
@@ -257,3 +258,21 @@ actions:
 List `person.*` (or `device_tracker.*`) entities in `follow_persons` to be alerted about landings near those people as well as the configured zone. Each minute the app reads their GPS location from Home Assistant. A landing within `radius_km` of the zone or any located person is sent to Telegram, and the message says who it is closest to, for example `Distance 4.2 km from Alex`. The map image is centred on that person.
 
 People without a location (for example with location tracking turned off) are skipped. The local history and archive still use the zone only. With `live_entities` enabled, sondes near a followed person also get trackers. Run **Diagnostics** to check which people currently have a location.
+
+## Flight summary
+
+The Flight page starts with a summary of the sonde:
+
+| Value | How it is calculated |
+| --- | --- |
+| Flight time | From the first to the last archived fix. |
+| Highest altitude | Highest valid GPS altitude. Shows the burst time when the sonde was seen climbing and falling at least 1 km around it. |
+| Fastest wind | Highest horizontal GPS speed, with the altitude where it occurred. |
+| Track length | Sum of the distances between consecutive fixes. Reception gaps over five minutes are skipped, so this is a lower bound. |
+| Launch to landing, or First to last fix | Straight-line distance and direction between the first and last fixes. It is labelled **Launch to landing** when both are below 1,500 m and the flight went higher than 3,000 m. |
+| Average ascent and descent | From the first fix to the burst, and from the burst to the last fix. Without an observed burst, the fastest vertical speeds are shown. |
+| Coldest reading, receivers, frequency, type | Lowest temperature, number of distinct uploading stations, most common transmit frequency, and the reported subtype. |
+
+The first and last fixes are listed with their time, altitude, and a map link. All values come from fixes inside the archive radius, so a flight launched or landed outside it shows only the part that was archived.
+
+Track statistics are calculated in the background, up to 100 flights a minute, for flights that received new fixes. Opening a flight calculates it immediately. After an upgrade, existing flights are filled in gradually; the Records table shows a dash until a flight has been calculated. The values are kept when `telemetry_retention_days` removes the raw fixes.

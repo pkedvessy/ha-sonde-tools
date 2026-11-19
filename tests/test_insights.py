@@ -132,7 +132,8 @@ class RecordsTests(unittest.TestCase):
         landing_history.record_telemetry(samples)
         landing_history.record_telemetry(samples)  # Duplicates do not change the summary.
         with closing(sqlite3.connect(self.database)) as db:
-            before = db.execute("SELECT * FROM flight_summaries").fetchall()
+            before = db.execute("SELECT serial, first_observed, last_observed, fixes, max_alt, max_speed, "
+                                "min_vertical, min_temp, type FROM flight_summaries").fetchall()
         self.assertEqual(len(before), 1)
         serial, _, _, fixes, altitude, speed, vertical, temp, kind = before[0]
         self.assertEqual((serial, fixes, kind), ("T1000003", len(rows), "RS41"))
@@ -146,8 +147,66 @@ class RecordsTests(unittest.TestCase):
         self.assertEqual(found["Highest altitude"], "28.00 km")
         page = landing_history.history_page({"tab": ["flight"], "serial": ["T1000003"]}, HOME, 30, UTC, map_url)
         self.assertIn("removed by telemetry retention", page)
-        self.assertIn("Highest 28.00 km", page)
+        self.assertIn("<strong>28.00 km</strong>", page)
         self.assertEqual(landing_history.archive_count(self.database, -1), 1)
+
+    def test_whole_track_statistics(self):
+        import flight_stats
+        rows = flight_rows("T1000007", top=30000)
+        for index, row in enumerate(rows):
+            row["tx_frequency"] = 403.5
+            row["subtype"] = "RS41-SGP"
+            row["uploader_callsign"] = f"RX{index % 3}"
+        samples, _ = prepare_samples(rows, HOME, 500)
+        landing_history.record_telemetry(samples)
+        self.assertEqual(flight_stats.refresh(self.database), 1)
+        self.assertEqual(flight_stats.refresh(self.database), 0)  # Nothing is dirty any more.
+        row = records.summary(self.database, "t1000007")
+        self.assertEqual(row["dirty"], 0)
+        self.assertEqual((row["receivers"], row["frequency"], row["subtype"]), (3, 403.5, "RS41-SGP"))
+        self.assertAlmostEqual(row["first_alt"], 100)
+        # The synthetic sonde moves 0.01° north and east per 100 s.
+        first, last = (row["first_lat"], row["first_lon"]), (row["last_lat"], row["last_lon"])
+        self.assertAlmostEqual(row["straight_km"], flight_stats.distance(first, last), places=2)
+        self.assertGreaterEqual(row["track_km"], row["straight_km"])
+        self.assertAlmostEqual(row["bearing"], 35, delta=3)  # North-east, compressed by latitude.
+        self.assertAlmostEqual(row["burst_observed"], START + (30000 - 100) // 50 * 10, delta=11)
+        self.assertAlmostEqual(row["speed_alt"], 11000, delta=60)
+        self.assertAlmostEqual(row["max_ascent"], 5)
+        self.assertTrue(records.launch_to_landing(row))
+        page = landing_history.history_page({"tab": ["flight"], "serial": ["T1000007"]}, HOME, 30, UTC, map_url)
+        for text in ("Launch to landing", "Average ascent", "5.0 m/s", "Average descent", "10.0 m/s",
+                     "Track length", "403.500 MHz", "RS41-SGP", "burst at"):
+            self.assertIn(text, page)
+
+    def test_new_fixes_mark_statistics_stale(self):
+        import flight_stats
+        rows = flight_rows("T1000008", top=5000)
+        samples, _ = prepare_samples(rows[:50], HOME, 500)
+        landing_history.record_telemetry(samples)
+        flight_stats.refresh(self.database)
+        short = records.summary(self.database, "T1000008")["track_km"]
+        samples, _ = prepare_samples(rows[50:], HOME, 500)
+        landing_history.record_telemetry(samples)
+        with closing(sqlite3.connect(self.database)) as db:
+            self.assertEqual(db.execute("SELECT dirty FROM flight_summaries").fetchone()[0], 1)
+        # Opening the flight refreshes it.
+        self.assertGreater(records.summary(self.database, "T1000008")["track_km"], short)
+
+    def test_records_table_sorts_and_lists_new_records(self):
+        import flight_stats
+        samples, _ = prepare_samples(flight_rows("T1000009", top=30000) + flight_rows("T1000010", top=12000),
+                                     HOME, 500)
+        landing_history.record_telemetry(samples)
+        flight_stats.refresh(self.database)
+        found = {label: serial for label, _, serial, _ in records.records(records.read(self.database, 2026, UTC), UTC)}
+        self.assertEqual(found["Longest track"], "T1000009")
+        self.assertEqual(found["Farthest drift"], "T1000009")
+        page = landing_history.history_page({"tab": ["records"], "year": ["2026"], "sort": ["altitude"]},
+                                            HOME, 30, UTC, map_url)
+        self.assertIn('<th aria-sort="descending">Highest ↓</th>', page)
+        self.assertLess(page.index(">T1000009</a></td>"), page.index(">T1000010</a></td>"))
+        self.assertIn("sort=track", page)
 
     def test_existing_archive_is_summarized_once_on_upgrade(self):
         samples, _ = prepare_samples(flight_rows("T1000004", top=5000), HOME, 500)
@@ -169,7 +228,7 @@ class RecordsTests(unittest.TestCase):
         self.assertEqual(records.period(2026, UTC, 12),
                          (datetime(2026, 12, 1, tzinfo=UTC).timestamp(), datetime(2027, 1, 1, tzinfo=UTC).timestamp()))
         data = records.read(self.database, 2026, UTC, 7)
-        self.assertEqual([row[0] for row in data["flights"]], ["T1000006"])
+        self.assertEqual([row["serial"] for row in data["flights"]], ["T1000006"])
         page = landing_history.history_page({"tab": ["records"], "year": ["2026"], "month": ["7"]}, HOME, 30, UTC,
                                             map_url)
         self.assertIn("Showing <strong>July 2026</strong>", page)
