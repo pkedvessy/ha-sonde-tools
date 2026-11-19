@@ -13,6 +13,7 @@ from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 import landing_history
+import live_entities
 import settings as app_settings
 from alert_state import AlertState
 from app_version import USER_AGENT
@@ -105,6 +106,10 @@ class Notifier:
         self.bootstrap = True
         self.history = {}
         self.predicted = {}
+        self.touchdowns = {}
+        self.centers = []
+        self.zone_name = "home"
+        self.live = None
         self.dashboard = None
         self.dashboard_state = None
         self.dashboard_updated = 0
@@ -160,6 +165,8 @@ class Notifier:
                 self.renderer = self.images = None
         if self.settings.dashboard_sensor:
             self.dashboard = Dashboard(request, self.token, self.health)
+        if self.settings.live_entities:
+            self.live = live_entities.LiveEntities(request, self.token, self.health)
         landing_history.serve(
             lambda: self.center, self.archive_radius, self.settings.timezone, map_url, self.recovery_reports,
             self.notify_radius, self.import_telemetry, self.settings.tiles, health=self.health,
@@ -328,6 +335,17 @@ class Notifier:
                             "Published with MQTT discovery." if mode == "mqtt" and connected else
                             "Waiting for the MQTT broker." if mode == "mqtt" else
                             "Published with the REST API (MQTT integration not found)."))
+        if self.live is not None:
+            results.append(("Live sonde entities",
+                            "Passed" if self.live.connected else "Failed" if self.live.client is None else "Waiting",
+                            "Published with MQTT discovery." if self.live.connected else
+                            "The MQTT integration was not found." if self.live.client is None else
+                            "Waiting for the MQTT broker."))
+        if self.settings.follow_persons:
+            people = self.resolve_people()
+            located = ", ".join(name for name, _ in people) or "nobody"
+            results.append(("Followed people", "Passed" if len(people) == len(self.settings.follow_persons) else "Check",
+                            f"{len(people)} of {len(self.settings.follow_persons)} have a location ({located})."))
         return results
 
     # ----- Alerts -----
@@ -338,27 +356,32 @@ class Notifier:
         if last_fix and last_fix[0] is None:
             kind = "Signal lost during descent"
         details = f"Last GPS fix: {map_url(last_fix[0])}\n" if last_fix and last_fix[0] else ""
-        km = distance(center, position)
-        if km <= self.archive_radius:
+        title = last_fix[1] if len(last_fix) > 1 else kind
+        if kind != "Predicted landing":
+            self.touchdowns[serial.upper()] = (when, position, title)
+        zone_km = distance(center, position)
+        if zone_km <= self.archive_radius:
             archive_kind = "Last GPS fix" if kind == "Signal lost during descent" else kind
             try:
-                landing_history.record(serial, archive_kind, now, when, position, km, last_fix[0] if last_fix else None)
+                landing_history.record(serial, archive_kind, now, when, position, zone_km,
+                                       last_fix[0] if last_fix else None)
                 self.health.healthy("Landing event archive")
             except sqlite3.Error as error:
                 logging.exception("Unable to archive event for %s", serial)
                 self.health.fail("Landing event archive", f"Could not save landing events ({error_detail(error)}).", threshold=1)
+        km, near, near_point = self.closest(center, position)
+        where = f" from {near}" if len(self.centers) > 1 else ""
         inside = km <= self.notify_radius
         previous = self.state.sent.get(key)
         tz = self.settings.timezone
         eta = datetime.fromtimestamp(when, tz).strftime("%Y-%m-%d %H:%M %Z")
-        title = last_fix[1] if len(last_fix) > 1 else kind
         if self.quiet():
             if inside and previous is None and key not in self.state.muted:
-                self.state.muted[key] = {"at": now, "line": f"{title} · {serial} · {km:.1f} km · {eta}\n{map_url(position)}"}
+                self.state.muted[key] = {"at": now, "line": f"{title} · {serial} · {km:.1f} km{where} · {eta}\n{map_url(position)}"}
                 self.save_alerts()
             logging.debug("%s / %s muted by quiet hours", kind, serial)
             return
-        message = (f"{title} · {serial}\nDistance {km:.1f} km\nTime {eta}\n"
+        message = (f"{title} · {serial}\nDistance {km:.1f} km{where}\nTime {eta}\n"
                    f"{map_url(position)}\n{details}https://sondehub.org/{quote(serial, safe='')}")
         if isinstance(previous, dict):
             self.update_forecast_message(key, previous, message, position, inside, serial)
@@ -369,7 +392,7 @@ class Notifier:
         if previous is not None:
             logging.debug("%s / %s skipped: already alerted", kind, serial)
             return
-        chats, photo = self.send_alert(message, serial, title, position, last_fix[0] if last_fix else None, center)
+        chats, photo = self.send_alert(message, serial, title, position, last_fix[0] if last_fix else None, near_point)
         self.health.healthy("Telegram delivery")
         message_id = chats[0].get("message_id")
         self.state.muted.pop(key, None)
@@ -379,6 +402,11 @@ class Notifier:
                                     "position": list(position), "inside": inside, "photo": photo, "edit_failures": 0}
         self.save_alerts()
         logging.info("Alert sent: %s / %s", kind, serial)
+
+    def closest(self, center, position):
+        """Return (km, name, point) of the zone or followed person closest to a landing position."""
+        centers = self.centers or [(self.zone_name, center)]
+        return min((distance(point, position), name, point) for name, point in centers)
 
     def update_forecast_message(self, key, previous, message, position, inside, serial):
         if not self.state.editable(key, self.entity):
@@ -446,7 +474,30 @@ class Notifier:
 
     def resolve_zone(self, timeout=20):
         zone = request(f"{HA}/states/{quote(self.settings.zone, safe='.')}", self.token, timeout=timeout)["attributes"]
+        name = zone.get("friendly_name")
+        if isinstance(name, str) and name.strip():
+            self.zone_name = name.strip()
         return point(zone["latitude"], zone["longitude"])
+
+    def resolve_people(self):
+        """Return [(name, position)] for followed people with a known GPS location."""
+        people, failed = [], False
+        for entity in self.settings.follow_persons:
+            try:
+                state = request(f"{HA}/states/{quote(entity, safe='.')}", self.token, timeout=10)
+                attributes = state["attributes"]
+                if attributes.get("latitude") is None or attributes.get("longitude") is None:
+                    logging.debug("Followed %s has no location (state %s)", entity, state.get("state"))
+                    continue
+                name = attributes.get("friendly_name") or entity.split(".", 1)[1]
+                people.append((str(name), point(attributes["latitude"], attributes["longitude"])))
+            except (OSError, EOFError, KeyError, TypeError, ValueError, AttributeError) as error:
+                logging.warning("Followed person %s: %s", entity, error)
+                self.health.fail("Followed people", f"Cannot read {entity} ({error_detail(error)}).")
+                failed = True
+        if self.settings.follow_persons and not failed:
+            self.health.healthy("Followed people")
+        return people
 
     def load_forecasts(self):
         try:
@@ -578,6 +629,18 @@ class Notifier:
                 logging.warning("Home Assistant dashboard sensor: %s", exc)
                 self.health.fail("Home Assistant dashboard sensor", f"Could not publish sensor state ({error_detail(exc)}).")
 
+    def update_live(self, now):
+        self.touchdowns = {serial: entry for serial, entry in self.touchdowns.items() if now - entry[0] <= 3 * 3600}
+        if self.live is None:
+            return
+        try:
+            state = live_entities.snapshot(self.history, self.predicted, self.touchdowns, self.centers,
+                                           self.archive_radius, self.notify_radius, now)
+            self.live.update(state, now)
+        except (OSError, ValueError, TypeError, RuntimeError) as exc:
+            logging.warning("Live sonde entities: %s", exc)
+            self.health.fail("Live sonde entities", f"Could not publish entity states ({error_detail(exc)}).")
+
     def poll(self):
         """Run one polling cycle. Returns False when the zone could not be resolved."""
         muted = self.quiet()
@@ -597,6 +660,7 @@ class Notifier:
             logging.warning("Home Assistant zone: %s", error)
             self.health.fail("Home Assistant zone", f"Cannot resolve the configured zone ({error_detail(error)}).")
             return False
+        self.centers = [(self.zone_name, center)] + self.resolve_people()
         if self.test_pending and not muted:
             try:
                 self.send("Sonde Tools · test message")
@@ -616,6 +680,7 @@ class Notifier:
             # After processing, so alerts that are still current go out in full and leave the summary.
             self.send_quiet_summary()
         self.update_dashboard(center, now)
+        self.update_live(now)
         self.health.healthy("Notifier stopped")
         return True
 

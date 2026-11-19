@@ -23,7 +23,11 @@ Sonde Tools uses the ha_sonde_tools app ID and starts with its own settings and 
 
 ## Browse landing history
 
-Open **Sonde Tools** from the Home Assistant sidebar or the app's Web UI. The app keeps a local archive of in-range events with a map, date filters, and serial search. History starts collecting when the app runs.
+Open **Sonde Tools** from the Home Assistant sidebar or the app's Web UI. The app keeps a local archive of in-range events with a map, date filters, and serial search. History starts collecting when the app runs. Each flight page includes an atmospheric sounding (Skew-T, wind profile, and hodograph), and the Records tab has a year in review.
+
+## Home Assistant entities and followed people
+
+With `live_entities`, nearby sondes and their landing points appear on the Home Assistant map, and sensors such as `binary_sensor.sonde_tools_incoming` can drive automations. With `follow_persons`, you are also alerted about landings near family members wherever they are. Both are described in the [configuration guide](ha_sonde_tools/DOCS.md).
 
 ## Reporting a problem
 

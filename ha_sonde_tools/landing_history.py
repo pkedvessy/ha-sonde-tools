@@ -18,6 +18,8 @@ from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 import archive_storage as archive
 import field_tools
+import records
+import sounding
 from app_version import APP_VERSION
 from flight_distance import chart as distance_chart
 from flight_distance import read_distances
@@ -52,6 +54,7 @@ ICONS = {
     "backfill": '<path d="M12 3v12m-4-4 4 4 4-4M5 16v4h14v-4"/>',
     "diagnostics": '<path d="M3 12h4l3-6 4 12 3-6h4M4 4h16v16H4z"/>',
     "database": '<ellipse cx="12" cy="5" rx="7" ry="3"/><path d="M5 5v7c0 2 3 3 7 3s7-1 7-3V5M5 12v7c0 2 3 3 7 3s7-1 7-3v-7"/>',
+    "records": '<path d="M8 21h8m-4-4v4M7 4h10v5a5 5 0 0 1-10 0V4ZM7 6H4v2a3 3 0 0 0 3 3m10-5h3v2a3 3 0 0 1-3 3"/>',
 }
 
 
@@ -244,6 +247,7 @@ def read_flight(serial, tz):
             WHERE serial = ? AND status = 'Recovered' AND latitude IS NOT NULL AND longitude IS NOT NULL
         """, (serial,)).fetchone()
         distances = read_distances(db, serial)
+        profile = sounding.read(db, serial)
     latest = tracks["tracks"][0]["latest"]["observed"] if tracks["tracks"] else 0
     if forecasts:
         latest = max(latest, forecasts[-1]["issued"])
@@ -258,7 +262,8 @@ def read_flight(serial, tz):
             scored.add(snapshot["issued"])
         forecasts = [dict(snapshot, score=snapshot["issued"] in scored) for snapshot in forecasts]
     return {"serial": serial, "tracks": tracks["tracks"], "limited": tracks["limited"],
-            "forecasts": forecasts, "recovery": position, "latest": read_latest(serial), "distances": distances}
+            "forecasts": forecasts, "recovery": position, "latest": read_latest(serial), "distances": distances,
+            "sounding": profile}
 
 
 def read_forecast_path(serial, issued):
@@ -287,7 +292,7 @@ def pending_recoveries(now):
         return [row[0] for row in db.execute("""
             WITH archived AS (
                 SELECT serial FROM events
-                UNION SELECT serial FROM telemetry_fixes
+                UNION SELECT serial FROM flight_summaries
                 UNION SELECT serial FROM forecasts
             )
             SELECT archived.serial FROM archived LEFT JOIN recovery USING (serial)
@@ -739,7 +744,8 @@ def full_map(rows, center, radius, timezone, map_url, notify_radius, tiles=None,
 @lru_cache(maxsize=4)
 def archive_count(database, minute):
     with closing(sqlite3.connect(database)) as db:
-        return db.execute("SELECT count(DISTINCT serial) FROM telemetry").fetchone()[0]
+        # Summaries outlive telemetry retention and avoid scanning every fix.
+        return db.execute("SELECT count(*) FROM flight_summaries").fetchone()[0]
 
 
 def archive_footprint(database):
@@ -901,17 +907,17 @@ def history_page(query, center, radius, timezone, map_url, notify_radius=None, i
     page_size = int(size_text) if size_text in ("25", "50", "100") else 25
     hide_recovered = query.get("hide_recovered") == ["1"]
     active_tab = query.get("tab", ["history"])[0]
-    if active_tab not in ("history", "map", "flight", "recovery", "heatmap", "coverage", "outlook", "scorecard", "backfill", "diagnostics"):
+    if active_tab not in ("history", "map", "flight", "recovery", "heatmap", "coverage", "outlook", "scorecard", "records", "backfill", "diagnostics"):
         active_tab = "history"
     show_map = active_tab == "map"
     show_flight = active_tab == "flight"
     show_recovery = active_tab == "recovery"
     show_heatmap = active_tab == "heatmap"
     exact_serial = show_flight or show_recovery
-    analytical = active_tab in ("heatmap", "coverage", "outlook", "scorecard", "backfill", "diagnostics")
+    analytical = active_tab in ("heatmap", "coverage", "outlook", "scorecard", "records", "backfill", "diagnostics")
     filters = {"days": period, "serial": serial, "hide_recovered": int(hide_recovered), "page_size": page_size}
     tabs = []
-    for tab, label in (("history", "History"), ("map", "Full map"), ("flight", "Flight"), ("recovery", "Recovery Mode"), ("heatmap", "Heatmap"), ("coverage", "Coverage"), ("outlook", "Launches"), ("scorecard", "Scorecard"), ("backfill", "Backfill"), ("diagnostics", "Diagnostics")):
+    for tab, label in (("history", "History"), ("map", "Full map"), ("flight", "Flight"), ("recovery", "Recovery Mode"), ("heatmap", "Heatmap"), ("coverage", "Coverage"), ("outlook", "Launches"), ("scorecard", "Scorecard"), ("records", "Records"), ("backfill", "Backfill"), ("diagnostics", "Diagnostics")):
         href = escape(urlencode({**filters, "tab": tab}))
         current = ' aria-current="page"' if tab == active_tab else ""
         tabs.append(f'<a href="?{href}"{current}>{icon(tab)}{label}</a>')
@@ -995,10 +1001,12 @@ def history_page(query, center, radius, timezone, map_url, notify_radius=None, i
         if serial:
             flight = read_flight(serial.strip(), timezone)
             distances = flight.pop("distances")
+            profile = flight.pop("sounding")
             content = ("<h2>Flight " + escape(flight["serial"]) + "</h2>"
                        "<p>Purple shows observed GPS fixes. Dashed blue shows the selected forecast, and faint blue dots show earlier touchdown estimates. Green marks a reported recovery when available.</p>"
+                       + records.flight_panel(DATABASE, flight["serial"], timezone)
                        + full_map([], center, radius, timezone, map_url, notify_radius, tiles, flight=flight)
-                       + distance_chart(distances))
+                       + distance_chart(distances) + sounding.chart(profile))
     if show_recovery:
         content = recovery_view(serial.strip(), query.get("terrain") == ["1"], timezone, map_url, tiles) if serial.strip() else "<h2>Recovery Mode</h2><p>Enter a sonde serial to open its recovery view.</p>"
     if show_heatmap:
@@ -1012,6 +1020,8 @@ def history_page(query, center, radius, timezone, map_url, notify_radius=None, i
         content = outlook_view(query, center, timezone, map_url)
     if active_tab == "scorecard":
         content = scorecard_view()
+    if active_tab == "records":
+        content = records.view(DATABASE, query, timezone)
     if active_tab == "backfill":
         content = backfill_view(backfill, center, radius, import_token) + maintenance_view(maintenance, import_token)
     if active_tab == "diagnostics":
