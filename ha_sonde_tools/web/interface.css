@@ -196,3 +196,25 @@ tbody tr:hover { background: var(--surface-alt); }
 .distance-chart { display: block; width: min(100%, 1000px); height: auto; margin-top: 16px; overflow: visible; }
 .distance-chart text { fill: currentColor; font-size: 11px; }
 .distance-chart circle:hover { r: 5; }
+
+.sounding-grid { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr) minmax(0, 1.6fr); gap: 16px; align-items: start; margin-top: 12px; }
+@media (max-width: 1100px) { .sounding-grid { grid-template-columns: 1fr; } }
+.sounding-chart { display: block; width: 100%; height: auto; overflow: visible; }
+.sounding-hodograph { max-width: 380px; }
+.sounding-chart text { fill: currentColor; font-size: 11px; }
+.sounding-facts { display: flex; flex-wrap: wrap; gap: 6px 8px; padding: 0; margin: 8px 0; list-style: none; }
+.sounding-facts li { padding: 2px 10px; border: 1px solid var(--line); border-radius: 999px; background: var(--surface-alt); font-size: .88rem; }
+@media (max-width: 1100px) { .sounding-chart { max-width: 640px; } }
+
+.records-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); gap: 12px; margin: 12px 0; }
+.record { padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-alt); }
+.record small { display: block; color: var(--muted); }
+.record strong { display: block; font-size: 1.35rem; font-variant-numeric: tabular-nums; }
+.record span { color: var(--muted); font-size: .85rem; }
+.review-chart { display: block; width: min(100%, 900px); height: auto; margin-top: 12px; overflow: visible; }
+.review-chart text { fill: currentColor; font-size: 11px; }
+.calendar-chart rect.day { fill: var(--line); }
+.calendar-chart rect.day[data-level="1"] { fill: #9fd8cc; }
+.calendar-chart rect.day[data-level="2"] { fill: #48b3a0; }
+.calendar-chart rect.day[data-level="3"] { fill: #008678; }
+.calendar-chart rect.day[data-level="4"] { fill: #024f47; }

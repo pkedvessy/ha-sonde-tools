@@ -7,15 +7,13 @@ history. Without MQTT, the state is written directly with the REST API as before
 import json
 import logging
 from threading import Lock
-from uuid import uuid4
 
-from app_version import APP_VERSION
+import mqtt_link
 from health_alerts import error_detail
 
 ENTITY_ID = "sensor.sonde_tools_nearest_active"
 BASE = "sonde_tools/nearest_active"
 DISCOVERY = "homeassistant/sensor/ha_sonde_tools/nearest_active/config"
-SUPERVISOR = "http://supervisor"
 CORE = "http://supervisor/core/api"
 
 
@@ -28,8 +26,7 @@ def discovery_config():
         "state_topic": f"{BASE}/state",
         "json_attributes_topic": f"{BASE}/attributes",
         "availability_topic": f"{BASE}/availability",
-        "device": {"identifiers": ["ha_sonde_tools"], "name": "Sonde Tools", "manufacturer": "Sonde Tools",
-                   "sw_version": APP_VERSION},
+        "device": mqtt_link.DEVICE,
     }
 
 
@@ -48,27 +45,12 @@ class Dashboard:
 
     def _start_mqtt(self):
         try:
-            service = self.request(f"{SUPERVISOR}/services/mqtt", self.token, timeout=10)
-            data = service.get("data") if isinstance(service, dict) else None
-            if not isinstance(data, dict) or not data.get("host"):
-                raise ValueError("No MQTT service is registered")
+            data = mqtt_link.broker(self.request, self.token)
         except (OSError, ValueError, EOFError) as error:
             logging.info("Dashboard sensor uses the REST API (MQTT unavailable: %s)", error_detail(error))
             return
         try:
-            import paho.mqtt.client as mqtt
-            client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
-                                 client_id=f"ha-sonde-tools-dashboard-{uuid4().hex[:12]}")
-            if data.get("username"):
-                client.username_pw_set(data["username"], data.get("password"))
-            if data.get("ssl"):
-                client.tls_set()
-            client.will_set(f"{BASE}/availability", "offline", retain=True)
-            client.on_connect = self._on_connect
-            client.on_disconnect = self._on_disconnect
-            client.reconnect_delay_set(5, 120)
-            client.connect_async(data["host"], int(data.get("port") or 1883))
-            client.loop_start()
+            client = mqtt_link.start(data, "dashboard", f"{BASE}/availability", self._on_connect, self._on_disconnect)
         except (OSError, ValueError, TypeError) as error:
             logging.warning("Dashboard MQTT setup failed, using the REST API: %s", error)
             return

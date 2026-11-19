@@ -24,6 +24,8 @@ For a local installation, copy the `ha_sonde_tools` directory into `/addons`, re
 | `debug` | `false` | Enables detailed polling and alert logs. |
 | `telegram_map_image` | `true` | Attaches a map image to landing and touchdown alerts. Set to `false` for text-only alerts. |
 | `dashboard_sensor` | `false` | Publishes `sensor.sonde_tools_nearest_active`. See [Home Assistant dashboard card](#home-assistant-dashboard-card). |
+| `live_entities` | `false` | Publishes live sonde map trackers and sensors through MQTT. See [Live sonde entities](#live-sonde-entities). |
+| `follow_persons` | Empty | `person.*` or `device_tracker.*` entities. Landings near any of them are alerted too. See [Alerts that follow people](#alerts-that-follow-people). |
 | `health_alerts` | `true` | Sends Telegram messages about failing data sources or storage. |
 | `dnd_enabled`, `dnd_from`, `dnd_to` | `false`, `22:00`, `07:00` | Quiet hours for Telegram. See [Do not disturb](#do-not-disturb). |
 | `dnd_summary` | `true` | After quiet hours, sends one summary of the alerts that were held back. |
@@ -152,7 +154,7 @@ content: |
 
 ## Telegram health alerts
 
-The app sends a health alert to the configured Telegram chat when a database write fails, a fatal error stops the notifier, or it detects three consecutive failures of a monitored service or parser. It monitors SondeHub forecast and telemetry inputs, recovery report sync, the Home Assistant zone, and the optional dashboard sensor. A failed Telegram send is also recorded and can be reported when delivery works again.
+The app sends a health alert to the configured Telegram chat when a database write fails, a fatal error stops the notifier, or it detects three consecutive failures of a monitored service or parser. It monitors SondeHub forecast and telemetry inputs, recovery report sync, the Home Assistant zone, followed people, and the optional dashboard sensor and live entities. A failed Telegram send is also recorded and can be reported when delivery works again.
 
 The app groups pending incidents into one message, suppresses repeats until the affected check succeeds again, and retries failed health alert delivery while running. Pending incidents are kept across restarts when the app can write its state file. If Home Assistant or Telegram is down, messages can only arrive after delivery recovers. Startup errors that prevent the app from reading its Telegram configuration are visible in the app log.
 
@@ -164,11 +166,11 @@ Open **Backfill** and choose a UTC date range of up to 366 days. **Fill gaps in 
 
 The worker checks one request at a time and saves each completed flight and its counts in SQLite. Pause stops after the current request, Resume continues, and Cancel keeps completed samples. A running job resumes after an app restart. Retry failed downloads after a job finishes with errors. The job keeps the zone and archive radius from its preview, stores only fixes inside that circle and UTC date range, and skips existing samples. It does not replay alerts, recreate historical forecasts, or add landing events.
 
-The header shows the number of distinct archived sonde serials and the approximate SQLite footprint, including the write-ahead log. Reload the page to update the footprint. The serial count is cached for up to a minute.
+The header shows the number of archived sonde serials (including flights whose raw fixes were removed by retention) and the approximate SQLite footprint, including the write-ahead log. Reload the page to update the footprint. The serial count is cached for up to a minute.
 
 ### Archive maintenance
 
-With `telemetry_retention_days` set, the app deletes GPS fixes, reception reports, and forecast paths older than that many days, ten minutes after startup and then every six hours. Landing events, recovery reports, and backfill progress are kept. Backfilled flights older than the retention period are removed at the next run.
+With `telemetry_retention_days` set, the app deletes GPS fixes, reception reports, and forecast paths older than that many days, ten minutes after startup and then every six hours. Landing events, recovery reports, flight summaries, and backfill progress are kept. The Flight page of a pruned flight still shows its summary. Backfilled flights older than the retention period are removed at the next run.
 
 Deleted rows free space inside the database for reuse, but the file does not shrink. Select **Compact database** under **Backfill** to rewrite the file and return the space to the disk. Compaction needs free disk space about the size of the database and can take several minutes on a large archive; live telemetry waits until it finishes.
 
@@ -184,7 +186,7 @@ The app keeps collecting telemetry and recording landing events during quiet hou
 
 ## Diagnostics
 
-Open **Diagnostics** to run integration checks for the SondeHub WebSocket and forecast API, Home Assistant zone, local SQLite archive, and the dashboard sensor. **Send Telegram test** sends a real message to the configured chat and reports the outcome. **Send Telegram map test** renders an alert map around the zone center and sends it as a photo, reporting map rendering and photo delivery separately. The test respects Do Not Disturb. These checks do not create flight events.
+Open **Diagnostics** to run integration checks for the SondeHub WebSocket and forecast API, Home Assistant zone, local SQLite archive, the dashboard sensor, live entities, and followed people. **Send Telegram test** sends a real message to the configured chat and reports the outcome. **Send Telegram map test** renders an alert map around the zone center and sends it as a photo, reporting map rendering and photo delivery separately. The test respects Do Not Disturb. These checks do not create flight events.
 
 ## Event pagination
 
@@ -199,3 +201,58 @@ The orange **Estimated total flight length** line adds travelled distance from t
 Recovery syncing checks all archived serials, including telemetry-only and forecast-only flights with no saved alert event. It refreshes up to 25 serials per minute, with each serial eligible again after 30 minutes; a large archive can take longer to refresh.
 
 A matching forecast with a future ETA does not block the low-altitude signal-loss fallback: after three minutes without a newer fix, a descending final fix at or below 500 m GPS altitude can trigger the fallback while source-health and notification filters still apply. This prevents a late forecast ETA from holding the fix until its ten-minute retention window expires.
+
+## Atmospheric sounding
+
+The Flight page also draws the weather profile that the sonde measured. Fixes from the ascent (or the descent, when only the descent was archived) are averaged into 100 m altitude steps.
+
+- **Skew-T log-P diagram.** Temperature (red) and dew point (green) against pressure, with isotherms skewed 45° and dashed dry adiabats. Dashed lines mark the tropopause and the 0 °C freezing level. Dew point is calculated from the reported relative humidity. Sondes without a pressure sensor, such as the RS41-SG, get pressure derived from GPS altitude and the measured temperature.
+- **Wind profile.** Wind speed by altitude from the sonde's GPS drift. Arrows show where the air moves, with north up. The strongest wind (usually the jet stream) is marked.
+- **Hodograph.** The wind vectors from the ground up, coloured from blue (low) to red (high). A curving line means the wind direction changes with height.
+
+The summary lists the burst altitude, freezing level, tropopause (WMO lapse-rate definition), coldest reading, and strongest wind. Only fixes inside the archive radius are saved, so a flight launched far away may show only part of its profile.
+
+## Records
+
+The **Records** tab summarizes a calendar year (in the app time zone) or all time:
+
+- Flights archived, saved GPS fixes, landings near you, and how many of them were reported recovered.
+- Records: highest altitude, fastest wind ride, fastest descent, coldest reading, longest archived track, and closest landing. Each links to the flight.
+- Flights and landings per month (or per year for all time), a day-by-day flight calendar, landing times by hour of day, and sonde types.
+
+Records come from flight summaries. A summary is kept for every archived serial and updated as fixes arrive (live or by Backfill), so records and counts stay complete when `telemetry_retention_days` removes the raw fixes. A flight belongs to the year of its first archived fix. Summaries are limited to fixes inside the archive radius. On upgrade, existing archives are summarized once from the fixes still present; flights already removed by retention cannot be recovered.
+
+## Live sonde entities
+
+Enable `live_entities` and restart. This needs the MQTT integration (for example the Mosquitto broker app). Entities are created through MQTT discovery under the **Sonde Tools** device:
+
+| Entity | Description |
+| --- | --- |
+| `binary_sensor.sonde_tools_incoming` | On while a landing is expected inside the Telegram radius of the zone or a followed person, and for 30 minutes after the expected time. Attributes list the serials, the nearest distance, and the next ETA. |
+| `sensor.sonde_tools_active_sondes` | Number of sondes with a GPS fix in the last three minutes inside the archive radius. |
+| `sensor.sonde_tools_next_landing` | Timestamp of the next expected landing inside the archive radius, with its serial and distance. |
+| `device_tracker.sonde_sonde_<serial>` | Live position of each nearby sonde, with altitude, speeds, heading, phase (ascending, descending, floating), and whether the signal is live or lost. |
+| `device_tracker.sonde_landing_<serial>` | Landing point: the latest forecast, or the touchdown estimate after signal loss. `gps_accuracy` reflects the uncertainty, so the map card draws a circle around it. |
+
+The trackers appear on the standard **Map** card. Add the sonde trackers you want, or use an auto-entities card to show all `device_tracker.sonde_*` entities. A tracker is removed one hour after its sonde was last updated; trackers left from before a restart are removed at the next update. At most 20 sondes are tracked, nearest first.
+
+Example automation that flashes a light when a sonde is about to land nearby:
+
+```yaml
+triggers:
+  - trigger: state
+    entity_id: binary_sensor.sonde_tools_incoming
+    to: "on"
+actions:
+  - action: light.turn_on
+    target:
+      entity_id: light.office
+    data:
+      flash: long
+```
+
+## Alerts that follow people
+
+List `person.*` (or `device_tracker.*`) entities in `follow_persons` to be alerted about landings near those people as well as the configured zone. Each minute the app reads their GPS location from Home Assistant. A landing within `radius_km` of the zone or any located person is sent to Telegram, and the message says who it is closest to, for example `Distance 4.2 km from Alex`. The map image is centred on that person.
+
+People without a location (for example with location tracking turned off) are skipped. The local history and archive still use the zone only. With `live_entities` enabled, sondes near a followed person also get trackers. Run **Diagnostics** to check which people currently have a location.

@@ -166,6 +166,7 @@ def initialize(db):
     """)
     normalize_existing(db)
     typed_schema(db)
+    initialize_summaries(db)
     normalized = ", ".join(f"f.{key}" for key in GPS)
     db.execute(f"""
         CREATE VIEW IF NOT EXISTS telemetry AS
@@ -179,6 +180,80 @@ def initialize(db):
             PRIMARY KEY (serial, issued, step)
         ) WITHOUT ROWID
     """)
+
+
+# Plausible ranges: anything outside is a decoding error and must not become a record.
+SUMMARY_LIMITS = {"alt": (-500, 50000), "vel_h": (0, 150), "vel_v": (-150, 0), "temp": (-110, 60)}
+
+
+def summary_sql(column):
+    low, high = SUMMARY_LIMITS[column]
+    return f"CASE WHEN {column} BETWEEN {low} AND {high} THEN {column} END"
+
+
+def initialize_summaries(db):
+    """Per-serial flight statistics that outlive telemetry retention."""
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS flight_summaries (
+            serial TEXT PRIMARY KEY, first_observed REAL NOT NULL, last_observed REAL NOT NULL,
+            fixes INTEGER NOT NULL, max_alt REAL, max_speed REAL, min_vertical REAL, min_temp REAL, type TEXT
+        ) WITHOUT ROWID
+    """)
+    db.execute("CREATE INDEX IF NOT EXISTS flight_summaries_first ON flight_summaries(first_observed)")
+    name = "flight_summaries_v1"
+    if db.execute("SELECT 1 FROM archive_migrations WHERE name=?", (name,)).fetchone():
+        return
+    # One-time fill from the fixes still present; fixes already removed by retention cannot be recovered.
+    db.execute(f"""
+        INSERT OR REPLACE INTO flight_summaries
+        SELECT serial, min(observed), max(observed), count(*), max({summary_sql("alt")}),
+               max({summary_sql("vel_h")}), min({summary_sql("vel_v")}), min({summary_sql("temp")}), max(type)
+        FROM telemetry_fixes GROUP BY serial
+    """)
+    db.execute("INSERT INTO archive_migrations VALUES (?)", (name,))
+
+
+def _limited(value, column):
+    low, high = SUMMARY_LIMITS[column]
+    return value if type(value) in (int, float) and math.isfinite(value) and low <= value <= high else None
+
+
+def _merge(current, new, pick):
+    values = [value for value in (current, new) if value is not None]
+    return pick(values) if values else None
+
+
+def summarize_fix(summaries, serial, observed, values):
+    """Fold one newly inserted fix into the pending per-serial summary."""
+    row = dict(zip(FIX, values))
+    entry = summaries.setdefault(serial, [observed, observed, 0, None, None, None, None, None])
+    entry[0], entry[1] = min(entry[0], observed), max(entry[1], observed)
+    entry[2] += 1
+    entry[3] = _merge(entry[3], _limited(row["alt"], "alt"), max)
+    entry[4] = _merge(entry[4], _limited(row["vel_h"], "vel_h"), max)
+    entry[5] = _merge(entry[5], _limited(row["vel_v"], "vel_v"), min)
+    entry[6] = _merge(entry[6], _limited(row["temp"], "temp"), min)
+    if entry[7] is None and isinstance(row["type"], str) and row["type"]:
+        entry[7] = row["type"]
+
+
+def write_summaries(db, summaries):
+    db.executemany("""
+        INSERT INTO flight_summaries (serial, first_observed, last_observed, fixes, max_alt, max_speed,
+                                      min_vertical, min_temp, type)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (serial) DO UPDATE SET
+            first_observed = min(first_observed, excluded.first_observed),
+            last_observed = max(last_observed, excluded.last_observed),
+            fixes = fixes + excluded.fixes,
+            max_alt = CASE WHEN max_alt IS NULL OR excluded.max_alt > max_alt THEN excluded.max_alt ELSE max_alt END,
+            max_speed = CASE WHEN max_speed IS NULL OR excluded.max_speed > max_speed
+                             THEN excluded.max_speed ELSE max_speed END,
+            min_vertical = CASE WHEN min_vertical IS NULL OR excluded.min_vertical < min_vertical
+                                THEN excluded.min_vertical ELSE min_vertical END,
+            min_temp = CASE WHEN min_temp IS NULL OR excluded.min_temp < min_temp THEN excluded.min_temp ELSE min_temp END,
+            type = coalesce(type, excluded.type)
+    """, ((serial, *entry) for serial, entry in summaries.items()))
 
 
 def scalar(value):
@@ -214,6 +289,7 @@ def write_packets(db, samples):
     fixes = {}
     receivers = {}
     added = 0
+    summaries = {}
     for serial, observed, uploader, row in samples:
         row = normalize(row)
         key = serial, observed
@@ -226,6 +302,7 @@ def write_packets(db, samples):
                     f"VALUES ({', '.join('?' for _ in range(len(FIX) + 2))})", (*key, *values),
                 )
                 found = (result.lastrowid, *values)
+                summarize_fix(summaries, serial, observed, values)
             fixes[key] = tuple(found)
         fix_id, *canonical = fixes[key]
         profile = tuple(scalar(row.get(name)) for name in RECEIVER)
@@ -261,6 +338,8 @@ def write_packets(db, samples):
         if extras:
             db.executemany("INSERT INTO telemetry_fields VALUES (?, ?, ?, ?, ?)",
                            ((fix_id, uploader, path, kind, value) for path, kind, value in extras))
+    if summaries:
+        write_summaries(db, summaries)
     return added
 
 
