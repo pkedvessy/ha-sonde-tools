@@ -161,6 +161,33 @@ class RecordsTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT serial, fixes FROM flight_summaries").fetchall(),
                              [("T1000004", len(samples))])
 
+    def test_month_filter_narrows_records_and_charts_by_day(self):
+        june = flight_rows("T1000005", top=30000)
+        july = [dict(row, datetime=row["datetime"].replace("2026-06-", "2026-07-")) for row in flight_rows("T1000006")]
+        samples, _ = prepare_samples(june + july, HOME, 500)
+        landing_history.record_telemetry(samples)
+        self.assertEqual(records.period(2026, UTC, 12),
+                         (datetime(2026, 12, 1, tzinfo=UTC).timestamp(), datetime(2027, 1, 1, tzinfo=UTC).timestamp()))
+        data = records.read(self.database, 2026, UTC, 7)
+        self.assertEqual([row[0] for row in data["flights"]], ["T1000006"])
+        page = landing_history.history_page({"tab": ["records"], "year": ["2026"], "month": ["7"]}, HOME, 30, UTC,
+                                            map_url)
+        self.assertIn("Showing <strong>July 2026</strong>", page)
+        self.assertIn("by day", page)
+        self.assertIn('<option value="7" selected>July</option>', page)
+        self.assertNotIn("Flight calendar", page)
+        self.assertIn("T1000006", page)
+        self.assertNotIn("T1000005", page)
+        # A month without a year (All time) is ignored.
+        page = landing_history.history_page({"tab": ["records"], "year": ["all"], "month": ["7"]}, HOME, 30, UTC,
+                                            map_url)
+        self.assertIn("Showing <strong>all time</strong>", page)
+        self.assertIn("T1000005", page)
+        # An invalid month falls back to the whole year.
+        page = landing_history.history_page({"tab": ["records"], "year": ["2026"], "month": ["13"]}, HOME, 30, UTC,
+                                            map_url)
+        self.assertIn("Showing <strong>2026</strong>", page)
+
     def test_empty_archive(self):
         page = landing_history.history_page({"tab": ["records"]}, HOME, 30, UTC, map_url)
         self.assertIn("No archived flights", page)

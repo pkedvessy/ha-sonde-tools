@@ -215,7 +215,7 @@ The summary lists the burst altitude, freezing level, tropopause (WMO lapse-rate
 
 ## Records
 
-The **Records** tab summarizes a calendar year (in the app time zone) or all time:
+The **Records** tab summarizes a calendar year, a single month of a year (both in the app time zone), or all time. Pick the year and optionally the month. A month view charts flights and landings by day and names the busiest day instead of drawing the year calendar. The month is ignored with **All time**:
 
 - Flights archived, saved GPS fixes, landings near you, and how many of them were reported recovered.
 - Records: highest altitude, fastest wind ride, fastest descent, coldest reading, longest archived track, and closest landing. Each links to the flight.

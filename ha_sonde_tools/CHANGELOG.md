@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.15.2
+
+### Added
+- Records can be filtered to a single month of a year. The month view charts flights and landings by day.
+
 ## 0.15.1
 
 ### Added
