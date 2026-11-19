@@ -1377,10 +1377,12 @@ def diagnostics_view(token, results):
               f"<tbody>{checks}</tbody></table></div>") if checks else ""
     return (
         f'<h2 class="section-title">{icon("diagnostics")}Diagnostics</h2>'
-        '<p>Check the data feed and local archive, or send a real test message to the configured Telegram chat.</p>'
+        '<p>Check the data feed and local archive, or send a real test message to the configured Telegram chat. '
+        'The map test renders an alert map around the zone center and sends it as a photo.</p>'
         f'<form class="form-row" method="post"><input type="hidden" name="token" value="{escape(token)}">'
         '<button name="diagnostic_action" value="checks">Run integration checks</button>'
-        '<button name="diagnostic_action" value="telegram">Send Telegram test</button></form>'
+        '<button name="diagnostic_action" value="telegram">Send Telegram test</button>'
+        '<button name="diagnostic_action" value="telegram_map">Send Telegram map test</button></form>'
         + report
     )
 
@@ -1600,7 +1602,7 @@ def serve(center, radius, timezone, map_url, fetch_reports, notify_radius, impor
                 return
             diagnostic_action = form.get("diagnostic_action", [""])[0]
             if diagnostic_action:
-                if diagnostics is None or diagnostic_action not in ("checks", "telegram"):
+                if diagnostics is None or diagnostic_action not in ("checks", "telegram", "telegram_map"):
                     self.send_error(400, "Unknown diagnostic action")
                     return
                 results = diagnostics(diagnostic_action)
