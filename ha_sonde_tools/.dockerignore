@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+DOCS.md
+CHANGELOG.md
+Dockerfile
+.dockerignore

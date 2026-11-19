@@ -2,9 +2,8 @@ import gzip
 import json
 import math
 import sqlite3
-import time
 from contextlib import closing
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from functools import lru_cache
 from statistics import median
 from urllib.parse import urlencode

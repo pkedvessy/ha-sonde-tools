@@ -1,22 +1,10 @@
 """Run with: python -m unittest discover -s tests."""
-import ast
-import math
-from pathlib import Path
-import sys
 import unittest
 from datetime import datetime, timezone
 
-# Load the production detector without starting MQTT, HA, or application services.
-ROOT = Path(__file__).resolve().parents[1] / "ha_sonde_tools"
-sys.path.insert(0, str(ROOT))
-from field_tools import distance
-source = ast.parse((ROOT / "notifier.py").read_text(encoding="utf-8"))
-functions = [node for node in source.body if isinstance(node, ast.FunctionDef)
-             and node.name in ("timestamp", "point", "landings")]
-namespace = dict(math=math, datetime=datetime, distance=distance,
-                 SIGNAL_LOSS_MAX_ALTITUDE_M=500, logging=__import__("logging"))
-exec(compile(ast.Module(body=functions, type_ignores=[]), str(ROOT / "notifier.py"), "exec"), namespace)
-landings = namespace["landings"]
+import support  # noqa: F401  (adds the app directory to sys.path)
+
+from detection import landings
 
 
 class LandingDetectionTests(unittest.TestCase):
@@ -25,12 +13,12 @@ class LandingDetectionTests(unittest.TestCase):
         self.row = dict(datetime="2026-11-08T01:06:47Z", lat=46.33959, lon=20.4069,
                         alt=157.02147, vel_v=-16.70299, vel_h=3.98718, heading=343.09175)
 
-    def replay(self, delay, eta_delay, altitude=None):
+    def replay(self, delay, eta_delay, altitude=None, ground=None):
         row = dict(self.row)
         if altitude is not None:
             row["alt"] = altitude
         forecast = {"X1722353": (self.at-60, self.at+eta_delay, (row["lat"], row["lon"]))}
-        return list(landings({"X1722353": row}, {}, self.at+delay, None, forecast))
+        return list(landings({"X1722353": row}, {}, self.at+delay, ground, forecast))
 
     def test_future_eta_does_not_block_low_altitude_fallback(self):
         for phase in range(60):
@@ -52,6 +40,25 @@ class LandingDetectionTests(unittest.TestCase):
     def test_no_forecast_fallback_is_unchanged(self):
         result = list(landings({"X1722353": self.row}, {}, self.at+180, None, {}))
         self.assertEqual(len(result), 1)
+
+    def test_ground_elevation_projects_touchdown(self):
+        result = list(landings({"X1722353": self.row}, {}, self.at+180, 100, {}))
+        serial, position, when, last = result[0]
+        self.assertAlmostEqual(last[0], self.row["lat"])
+        self.assertAlmostEqual(last[1], self.row["lon"])
+        self.assertNotEqual(position, last)
+        self.assertAlmostEqual(when - self.at, (157.02147 - 100) / 16.70299, places=3)
+
+    def test_stale_fix_is_forgotten(self):
+        history = {}
+        list(landings({"X1722353": self.row}, history, self.at+30, None, {}))
+        self.assertIn("X1722353", history)
+        list(landings({}, history, self.at+601, None, {}))
+        self.assertNotIn("X1722353", history)
+
+    def test_ascending_sonde_is_ignored(self):
+        row = dict(self.row, vel_v=5)
+        self.assertEqual(list(landings({"X1722353": row}, {}, self.at+300, None, {})), [])
 
 
 if __name__ == "__main__":

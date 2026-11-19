@@ -1,8 +1,8 @@
 import hashlib
 import math
 import re
-from decimal import Decimal, InvalidOperation
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 
 FIX = (
     "datetime", "frame", "lat", "lon", "alt", "vel_v", "vel_h", "heading", "sats",
