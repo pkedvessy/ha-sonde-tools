@@ -246,6 +246,30 @@ class LiveEntityTests(unittest.TestCase):
         self.assertIn("homeassistant/device_tracker/ha_sonde_tools/sonde_old1/config", removed)
 
 
+class BrokerSettingsTests(unittest.TestCase):
+    base = {"telegram_entity": "notify.chat", "timezone": "UTC"}
+
+    def test_external_broker_is_used_without_asking_the_supervisor(self):
+        import mqtt_link
+        parsed = settings.parse({**self.base, "mqtt_host": " 10.0.0.102 ", "mqtt_username": "sonde",
+                                 "mqtt_password": "secret"})
+        self.assertEqual(parsed.mqtt_broker, {"host": "10.0.0.102", "port": 1883, "username": "sonde",
+                                              "password": "secret", "ssl": False})
+        self.assertNotIn("secret", repr(parsed))
+        request = mock.Mock(side_effect=AssertionError("Supervisor must not be asked"))
+        self.assertEqual(mqtt_link.broker(request, "token", parsed.mqtt_broker)["host"], "10.0.0.102")
+
+    def test_without_host_the_supervisor_service_is_used(self):
+        import mqtt_link
+        self.assertIsNone(settings.parse(self.base).mqtt_broker)
+        request = mock.Mock(return_value={"data": {"host": "core-mosquitto", "port": 1883}})
+        self.assertEqual(mqtt_link.broker(request, "token", None)["host"], "core-mosquitto")
+
+    def test_url_style_host_is_rejected(self):
+        with self.assertRaises(ValueError):
+            settings.parse({**self.base, "mqtt_host": "mqtt://10.0.0.102:1883"})
+
+
 class FollowSettingsTests(unittest.TestCase):
     def test_follow_persons_are_validated(self):
         base = {"telegram_entity": "notify.chat", "timezone": "UTC"}

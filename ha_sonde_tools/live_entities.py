@@ -152,7 +152,7 @@ def tracker_config(kind, serial):
 
 
 class LiveEntities:
-    def __init__(self, request, token, health):
+    def __init__(self, request, token, health, broker=None):
         self.health = health
         self.lock = Lock()
         self.connected = False
@@ -161,7 +161,7 @@ class LiveEntities:
         self.retained = set()  # Tracker keys found on the broker from earlier runs.
         self.last_sensors = None
         try:
-            data = mqtt_link.broker(request, token)
+            data = mqtt_link.broker(request, token, broker)
             self.client = mqtt_link.start(data, "live", AVAILABILITY, self._on_connect, self._on_disconnect,
                                           self._on_message)
             logging.info("Live sonde entities use MQTT discovery at %s", data["host"])

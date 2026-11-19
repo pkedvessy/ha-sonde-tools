@@ -164,9 +164,9 @@ class Notifier:
                 logging.warning("Telegram map images disabled: %s", error)
                 self.renderer = self.images = None
         if self.settings.dashboard_sensor:
-            self.dashboard = Dashboard(request, self.token, self.health)
+            self.dashboard = Dashboard(request, self.token, self.health, self.settings.mqtt_broker)
         if self.settings.live_entities:
-            self.live = live_entities.LiveEntities(request, self.token, self.health)
+            self.live = live_entities.LiveEntities(request, self.token, self.health, self.settings.mqtt_broker)
         landing_history.serve(
             lambda: self.center, self.archive_radius, self.settings.timezone, map_url, self.recovery_reports,
             self.notify_radius, self.import_telemetry, self.settings.tiles, health=self.health,

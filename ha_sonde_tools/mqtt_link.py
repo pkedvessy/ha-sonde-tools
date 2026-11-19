@@ -8,12 +8,18 @@ DEVICE = {"identifiers": ["ha_sonde_tools"], "name": "Sonde Tools", "manufacture
           "sw_version": APP_VERSION}
 
 
-def broker(request, token):
-    """Return the Supervisor's MQTT service details. Raises OSError/ValueError/EOFError."""
+def broker(request, token, manual=None):
+    """Return MQTT connection details. Raises OSError/ValueError/EOFError.
+
+    A broker configured in the app options (``manual``) wins; otherwise the broker the Supervisor
+    advertises, which exists only when an MQTT broker app such as Mosquitto is installed.
+    """
+    if manual:
+        return manual
     service = request(f"{SUPERVISOR}/services/mqtt", token, timeout=10)
     data = service.get("data") if isinstance(service, dict) else None
     if not isinstance(data, dict) or not data.get("host"):
-        raise ValueError("No MQTT service is registered")
+        raise ValueError("No MQTT service is registered; set mqtt_host for an external broker")
     return data
 
 
