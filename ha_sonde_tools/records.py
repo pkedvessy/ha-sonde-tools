@@ -1,22 +1,29 @@
 """Records and year-in-review statistics from the local archive."""
 import re
 import sqlite3
+from calendar import monthrange
 from contextlib import closing
 from datetime import date, datetime, timedelta
 from html import escape
 from urllib.parse import quote
 
 MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+FULL_MONTHS = ("January", "February", "March", "April", "May", "June", "July", "August", "September", "October",
+               "November", "December")
 FLIGHT_COLOR = "#7851c8"
 LANDING_COLOR = "#008678"
 
 
-def period(year, tz):
-    """Return (start, end) timestamps for a calendar year in the app time zone, or all time."""
+def period(year, tz, month=None):
+    """Return (start, end) timestamps for a calendar year or month in the app time zone, or all time."""
     if year is None:
         return 0, 253402300799
-    start = datetime(year, 1, 1, tzinfo=tz)
-    return start.timestamp(), start.replace(year=year + 1).timestamp()
+    if month is None:
+        start = datetime(year, 1, 1, tzinfo=tz)
+        return start.timestamp(), start.replace(year=year + 1).timestamp()
+    start = datetime(year, month, 1, tzinfo=tz)
+    end = start.replace(year=year + 1, month=1) if month == 12 else start.replace(month=month + 1)
+    return start.timestamp(), end.timestamp()
 
 
 def available_years(db, tz):
@@ -40,17 +47,17 @@ def flights(db, start, end):
     """, (start, end)).fetchall()
 
 
-def read(database, year, tz):
+def read(database, year, tz, month=None):
     with closing(sqlite3.connect(database)) as db:
         years = available_years(db, tz)
-        start, end = period(year, tz)
+        start, end = period(year, tz, month)
         rows = flights(db, start, end)
         events = db.execute("""
             SELECT e.serial, e.kind, e.event_time, e.distance_km, r.status, r.reported, e.recorded
             FROM events AS e LEFT JOIN recovery AS r USING (serial)
             WHERE e.event_time >= ? AND e.event_time < ?
         """, (start, end)).fetchall()
-    return {"years": years, "year": year, "flights": rows, "events": events}
+    return {"years": years, "year": year, "month": month, "flights": rows, "events": events}
 
 
 def _best(rows, index, pick=max):
@@ -184,15 +191,28 @@ def flight_panel(database, serial, tz):
 def view(database, query, tz):
     text = query.get("year", [""])[0]
     year = int(text) if re.fullmatch(r"(19|20)\d\d", text) else None
-    data = read(database, year, tz)
-    if year is None and not text and data["years"]:
-        year = data["years"][0]
-        data = read(database, year, tz)
+    month_text = query.get("month", [""])[0]
+    # A month only narrows a chosen year; with "All time" it is ignored.
+    month = int(month_text) if re.fullmatch(r"[1-9]|1[0-2]", month_text) else None
+    if year is None and not text:
+        with closing(sqlite3.connect(database)) as db:
+            years = available_years(db, tz)
+        year = years[0] if years else None
+    if year is None:
+        month = None
+    data = read(database, year, tz, month)
     options = '<option value="all">All time</option>' + "".join(
         f'<option value="{value}" {"selected" if value == year else ""}>{value}</option>' for value in data["years"])
+    month_options = '<option value="">All months</option>' + "".join(
+        f'<option value="{index}" {"selected" if index == month else ""}>{name}</option>'
+        for index, name in enumerate(FULL_MONTHS, 1))
+    title = ("all time" if year is None else str(year) if month is None else f"{FULL_MONTHS[month - 1]} {year}")
     heading = ('<h2>Records and year in review</h2>'
                '<form class="form-row" method="get"><input type="hidden" name="tab" value="records">'
-               f'<label>Period <select name="year">{options}</select></label><button>Show</button></form>')
+               f'<label>Year <select name="year">{options}</select></label>'
+               f'<label>Month <select name="month">{month_options}</select></label>'
+               f'<button>Show</button></form><p>Showing <strong>{escape(title)}</strong>.'
+               + (" Choose a year to filter by month." if year is None else "") + "</p>")
     rows = data["flights"]
     if not rows and not data["events"]:
         return heading + "<p>No archived flights for this period yet.</p>"
@@ -217,16 +237,24 @@ def view(database, query, tz):
     for serial, _, when, *_ in data["events"]:
         moment = datetime.fromtimestamp(when, tz)
         landing_days.setdefault(serial, moment)
-    if year is not None:
+    if month is not None:
+        length = monthrange(year, month)[1]
+        labels = list(range(1, length + 1))
+        flight_counts = [sum(moment.day == day for moment in first_seen) for day in labels]
+        landing_counts = [sum(moment.day == day for moment in landing_days.values()) for day in labels]
+        unit = "day"
+    elif year is not None:
         labels = list(MONTHS)
-        flight_counts = [sum(moment.month == month for moment in first_seen) for month in range(1, 13)]
-        landing_counts = [sum(moment.month == month for moment in landing_days.values()) for month in range(1, 13)]
+        flight_counts = [sum(moment.month == value for moment in first_seen) for value in range(1, 13)]
+        landing_counts = [sum(moment.month == value for moment in landing_days.values()) for value in range(1, 13)]
+        unit = "month"
     else:
+        unit = "year"
         years = sorted({moment.year for moment in first_seen} | {moment.year for moment in landing_days.values()})
         labels = years
         flight_counts = [sum(moment.year == value for moment in first_seen) for value in years]
         landing_counts = [sum(moment.year == value for moment in landing_days.values()) for value in years]
-    timeline = ('<h3>Flights and landings by ' + ("month" if year is not None else "year") + "</h3>"
+    timeline = (f"<h3>Flights and landings by {unit}</h3>"
                 f'<div class="legend"><span style="color:{FLIGHT_COLOR}">Flights archived</span>'
                 f'<span style="color:{LANDING_COLOR}">Landings near you</span></div>'
                 + bar_chart(labels, [("Flights", FLIGHT_COLOR, flight_counts),
@@ -240,7 +268,9 @@ def view(database, query, tz):
         days[moment.date()] = days.get(moment.date(), 0) + 1
     busiest = max(days.items(), key=lambda item: item[1]) if days else None
     calendar_view = ""
-    if year is not None and rows:
+    if month is not None and busiest:
+        calendar_view = f"<p>Busiest day: {busiest[0]:%Y-%m-%d} with {busiest[1]} flights.</p>"
+    elif year is not None and rows:
         calendar_view = (f"<h3>Flight calendar {year}</h3><p>Flights by the day of their first archived fix."
                          + (f" Busiest day: {busiest[0]:%Y-%m-%d} with {busiest[1]} flights." if busiest else "")
                          + "</p>" + calendar(year, days))
